@@ -27,6 +27,179 @@ func (fn roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 	return fn(r)
 }
 
+type fakeAppleAuthLoginClient struct {
+	startProtocolResult      appleAuthStartResult
+	startProtocolErr         error
+	startAppleAccountResult  appleAuthStartResult
+	startAppleAccountErr     error
+	submitProtocolResult     ICloudSession
+	submitProtocolErr        error
+	submitAppleAccountResult ICloudSession
+	submitAppleAccountErr    error
+}
+
+func (f *fakeAppleAuthLoginClient) HTTPClient() *http.Client {
+	return &http.Client{}
+}
+
+func (f *fakeAppleAuthLoginClient) StartLogin(context.Context, string, string, string, string, *appleAuthPendingStore, string) (appleAuthStartResult, error) {
+	return f.startProtocolResult, f.startProtocolErr
+}
+
+func (f *fakeAppleAuthLoginClient) StartAppleAccountManageLogin(context.Context, string, string, *appleAuthPendingStore, string) (appleAuthStartResult, error) {
+	return f.startAppleAccountResult, f.startAppleAccountErr
+}
+
+func (f *fakeAppleAuthLoginClient) Submit2FA(context.Context, appleAuthPending, string) (ICloudSession, error) {
+	return f.submitProtocolResult, f.submitProtocolErr
+}
+
+func (f *fakeAppleAuthLoginClient) SubmitAppleAccountManage2FA(context.Context, appleAuthPending, string, json.RawMessage) (ICloudSession, error) {
+	return f.submitAppleAccountResult, f.submitAppleAccountErr
+}
+
+func testICloudWebSession(appleID string) ICloudSession {
+	return ICloudSession{
+		AppleID: appleID,
+		Host:    "www.icloud.com",
+		Cookies: []SessionCookie{{Name: "web-session", Value: "ok", Domain: ".icloud.com", Path: "/"}},
+		LoginStates: []LoginState{{
+			Kind:    LoginStateICloudWeb,
+			Host:    "www.icloud.com",
+			Origin:  "https://www.icloud.com",
+			Cookies: []SessionCookie{{Name: "web-session", Value: "ok", Domain: ".icloud.com", Path: "/"}},
+		}},
+	}
+}
+
+func TestAppleAuthClientAuthSRPTreats423AsTwoFactorChallenge(t *testing.T) {
+	var completeCalled bool
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "POST /signin/init":
+			_, _ = w.Write([]byte(`{"iteration":1,"salt":"c2FsdA==","protocol":"s2k","b":"Ag==","c":"proof-context"}`))
+		case "POST /signin/complete":
+			completeCalled = true
+			w.WriteHeader(http.StatusLocked)
+			_, _ = w.Write([]byte(`{"trustedPhoneNumbers":[{"id":17,"nonFTEU":true}]}`))
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+
+	session := &appleAuthSession{
+		Endpoints:   appleAuthEndpoints{Home: "https://account.apple.com", Auth: ts.URL},
+		AppleID:     "user@example.com",
+		ClientID:    appleAccountManageOAuthClientID,
+		HCBits:      8,
+		HCChallenge: "initial-challenge",
+		UserAgent:   appleAccountManageUserAgent,
+	}
+	client := &AppleAuthClient{httpClient: ts.Client()}
+	needs2FA, err := client.authSRP(t.Context(), session, "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !needs2FA || !completeCalled {
+		t.Fatalf("needs2FA=%t completeCalled=%t, want true/true", needs2FA, completeCalled)
+	}
+	var phone map[string]any
+	if err := json.Unmarshal(session.TwoFactorPhone, &phone); err != nil {
+		t.Fatal(err)
+	}
+	if phone["id"] != float64(17) || phone["nonFTEU"] != true {
+		t.Fatalf("TwoFactorPhone = %#v, want id=17 nonFTEU=true", phone)
+	}
+}
+
+func TestHandleStartAppleAccountLoginFallsBackAfterManage502(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{PublicBaseURL: "https://mail.example"}, store, discardLogger())
+	server := handler.(*Server)
+	cookie, user := registerTestUser(t, handler, "apple-start-fallback", "user123")
+	client := &fakeAppleAuthLoginClient{
+		startAppleAccountErr: errCode("apple_account_api_failed", "Apple Account 接口失败；阶段：刷新管理 token；HTTP 502；原始返回：Bad Gateway", true),
+	}
+	server.appleAuthClientFactory = func() appleAuthLoginClient { return client }
+	server.fallbackAppleAccountToICloudWebFunc = func(ctx context.Context, ownerID string, credentials *AppleLoginCredentials) (ICloudSession, appleAuthStartResult, error) {
+		if ownerID != user.ID || credentials.Password != "apple-password" {
+			t.Fatalf("fallback owner/password = %q/%q, want %q/apple-password", ownerID, credentials.Password, user.ID)
+		}
+		return testICloudWebSession(credentials.AppleID), appleAuthStartResult{Message: "旧接口复用成功"}, nil
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/apple-account/login/start", strings.NewReader(`{"apple_id":"user@example.com","password":"apple-password"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(cookie)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rr.Code, rr.Body.String())
+	}
+	var body struct {
+		Success bool   `json:"success"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if !body.Success || !strings.Contains(body.Message, "复用并校验旧接口登录态") {
+		t.Fatalf("response = %+v, want successful fallback", body)
+	}
+	if sessions := store.ICloudSessionsForOwner(user.ID); len(sessions) != 1 || !iCloudWebLoginSaved(sessions[0]) {
+		t.Fatalf("saved sessions = %+v, want one iCloud web session", sessions)
+	}
+}
+
+func TestHandleSubmitAppleAccount2FAReturnsFallbackAfterManage502(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{PublicBaseURL: "https://mail.example"}, store, discardLogger())
+	server := handler.(*Server)
+	cookie, user := registerTestUser(t, handler, "apple-submit-fallback", "user123")
+	client := &fakeAppleAuthLoginClient{
+		submitAppleAccountErr: errCode("apple_account_api_failed", "Apple Account 接口失败；阶段：刷新管理 token；HTTP 502；原始返回：Bad Gateway", true),
+	}
+	server.appleAuthClientFactory = func() appleAuthLoginClient { return client }
+	credentials := &AppleLoginCredentials{AppleID: "user@example.com", Password: "apple-password"}
+	pending, err := server.appleAccountLogins.putWithCredentials(&appleAuthSession{}, credentials)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.fallbackAppleAccountToICloudWebFunc = func(ctx context.Context, ownerID string, got *AppleLoginCredentials) (ICloudSession, appleAuthStartResult, error) {
+		if ownerID != user.ID || got.Password != credentials.Password {
+			t.Fatalf("fallback owner/password = %q/%q, want %q/%q", ownerID, got.Password, user.ID, credentials.Password)
+		}
+		return testICloudWebSession(got.AppleID), appleAuthStartResult{}, nil
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/apple-account/login/2fa", strings.NewReader(fmt.Sprintf(`{"pending_id":%q,"code":"123456"}`, pending.ID)))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(cookie)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rr.Code, rr.Body.String())
+	}
+	var body struct {
+		Success bool   `json:"success"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if !body.Success || !strings.Contains(body.Message, "复用并校验旧接口登录态") {
+		t.Fatalf("response = %+v, want successful fallback", body)
+	}
+	if _, ok := server.appleAccountLogins.get(pending.ID); ok {
+		t.Fatal("Apple Account pending login remains after fallback")
+	}
+	if sessions := store.ICloudSessionsForOwner(user.ID); len(sessions) != 1 || !iCloudWebLoginSaved(sessions[0]) {
+		t.Fatalf("saved sessions = %+v, want one iCloud web session", sessions)
+	}
+}
+
 func TestExtractOTP(t *testing.T) {
 	tests := []struct {
 		name string
@@ -110,6 +283,37 @@ func TestAppleAccountFDClientInfoUsesBrowserFingerprint(t *testing.T) {
 	}
 }
 
+func TestIsAppleAccountManage502(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "manage token 502",
+			err:  errCode("apple_account_api_failed", "Apple Account 接口失败；阶段：刷新管理 token；HTTP 502；原始返回：Bad Gateway", true),
+			want: true,
+		},
+		{
+			name: "other 502",
+			err:  errCode("apple_account_api_failed", "Apple Account 接口失败；阶段：打开隐私页面；HTTP 502；原始返回：Bad Gateway", true),
+			want: false,
+		},
+		{
+			name: "423",
+			err:  errCode("apple_protocol_http_error", "Apple 协议 HTTP 423", true),
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isAppleAccountManage502(tt.err); got != tt.want {
+				t.Fatalf("isAppleAccountManage502() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestAppleDomainRedirectMapsDomainToHost(t *testing.T) {
 	tests := []struct {
 		domain string
@@ -117,7 +321,7 @@ func TestAppleDomainRedirectMapsDomainToHost(t *testing.T) {
 	}{
 		{domain: "iCloud.com", want: "www.icloud.com"},
 		{domain: "www.icloud.com", want: "www.icloud.com"},
-		{domain: "https://www.icloud.com.cn/", want: "www.icloud.com.cn"},
+		{domain: "https://www.icloud.com/", want: "www.icloud.com"},
 		{domain: "example.com", want: ""},
 	}
 	for _, tt := range tests {
@@ -141,16 +345,16 @@ func TestParseAppleDomainRedirect(t *testing.T) {
 	}
 }
 
-func TestAppleAuthSessionSwitchHost(t *testing.T) {
-	session := &appleAuthSession{Endpoints: appleAuthEndpointsForHost("www.icloud.com.cn")}
-	if !session.switchHost("www.icloud.com") {
-		t.Fatal("switchHost returned false, want true")
-	}
-	if session.Endpoints.Host != "www.icloud.com" || !strings.Contains(session.Endpoints.Auth, "idmsa.apple.com/appleauth") {
-		t.Fatalf("endpoints after switch = %+v", session.Endpoints)
+func TestAppleAuthSessionAlwaysUsesGlobalEndpoints(t *testing.T) {
+	session := &appleAuthSession{Endpoints: appleAuthEndpointsForHost("legacy-icloud-host")}
+	if session.Endpoints.Home != "https://www.icloud.com" ||
+		session.Endpoints.Setup != "https://setup.icloud.com/setup/ws/1" ||
+		!strings.Contains(session.Endpoints.Auth, "idmsa.apple.com/appleauth") ||
+		session.Endpoints.Host != "www.icloud.com" {
+		t.Fatalf("endpoints = %+v, want global iCloud endpoints", session.Endpoints)
 	}
 	if session.switchHost("www.icloud.com") {
-		t.Fatal("switchHost returned true for same host")
+		t.Fatal("switchHost returned true for the already-normalized global host")
 	}
 }
 
@@ -160,8 +364,8 @@ func TestAppleHostForAccountCountry(t *testing.T) {
 		want    string
 	}{
 		{country: "", want: ""},
-		{country: "CHN", want: "www.icloud.com.cn"},
-		{country: "CN", want: "www.icloud.com.cn"},
+		{country: "CHN", want: "www.icloud.com"},
+		{country: "CN", want: "www.icloud.com"},
 		{country: "USA", want: "www.icloud.com"},
 		{country: "sgp", want: "www.icloud.com"},
 	}
@@ -172,21 +376,17 @@ func TestAppleHostForAccountCountry(t *testing.T) {
 	}
 }
 
-func TestAppleAuthSessionRedirectForAccountCountry(t *testing.T) {
+func TestAppleAuthSessionDoesNotRedirectForAccountCountry(t *testing.T) {
 	session := &appleAuthSession{
-		Endpoints:      appleAuthEndpointsForHost("www.icloud.com.cn"),
+		Endpoints:      appleAuthEndpointsForHost("www.icloud.com"),
 		AccountCountry: "USA",
 	}
-	redirect, ok := session.redirectForAccountCountry()
-	if !ok {
-		t.Fatal("redirectForAccountCountry returned ok=false")
-	}
-	if redirect.Host != "www.icloud.com" || redirect.DomainToUse != "iCloud.com" {
-		t.Fatalf("redirect = %+v, want www.icloud.com", redirect)
+	if _, ok := session.redirectForAccountCountry(); ok {
+		t.Fatal("redirectForAccountCountry returned ok=true for global endpoints")
 	}
 
 	session = &appleAuthSession{
-		Endpoints:      appleAuthEndpointsForHost("www.icloud.com.cn"),
+		Endpoints:      appleAuthEndpointsForHost("www.icloud.com"),
 		AccountCountry: "CHN",
 	}
 	if _, ok := session.redirectForAccountCountry(); ok {
@@ -225,11 +425,11 @@ func TestRetryAppleTransientRetriesEOF(t *testing.T) {
 
 func TestCookieHeaderFiltersByDomainAndExpiry(t *testing.T) {
 	cookies := []SessionCookie{
-		{Name: "ok", Value: "1", Domain: ".icloud.com.cn", Path: "/"},
+		{Name: "ok", Value: "1", Domain: ".icloud.com", Path: "/"},
 		{Name: "other", Value: "2", Domain: ".example.com", Path: "/"},
-		{Name: "expired", Value: "3", Domain: ".icloud.com.cn", Path: "/", Expires: 1},
+		{Name: "expired", Value: "3", Domain: ".icloud.com", Path: "/", Expires: 1},
 	}
-	got := cookieHeader(cookies, "https://p213-maildomainws.icloud.com.cn/v1/hme/generate")
+	got := cookieHeader(cookies, "https://p213-maildomainws.icloud.com/v1/hme/generate")
 	if got != "ok=1" {
 		t.Fatalf("cookieHeader() = %q, want ok=1", got)
 	}
@@ -250,8 +450,8 @@ func TestAppleAccountManageFingerprintUsesCapturedLocale(t *testing.T) {
 	if err := json.Unmarshal([]byte(appleAccountFDClientInfo("test-agent")), &info); err != nil {
 		t.Fatal(err)
 	}
-	if info["U"] != "test-agent" || info["L"] != appleAccountManageLanguage || info["Z"] != "GMT+08:00" {
-		t.Fatalf("fingerprint info = %#v, want zh/GMT+08:00", info)
+	if info["U"] != "test-agent" || info["L"] != appleAccountManageLanguage || info["Z"] != appleAccountManageGMTOffset {
+		t.Fatalf("fingerprint info = %#v, want %s/%s", info, appleAccountManageLanguage, appleAccountManageGMTOffset)
 	}
 	if strings.TrimSpace(info["F"]) == "" {
 		t.Fatalf("fingerprint info missing compressed fingerprint: %#v", info)
@@ -275,7 +475,7 @@ func TestAppleAccountAPIErrorDoesNotTreatGenericHTTPAsAuthExpired(t *testing.T) 
 
 func TestLoadConfigPublicCodeSyncSettings(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
-	if err := os.WriteFile(path, []byte(`{"mail_watcher_enabled":false,"mail_watcher_poll_ms":2500,"mail_watcher_fetch_limit":6,"mail_watcher_initial_fetch_limit":16,"mail_watcher_lookback_hours":12,"public_fast_sync_wait_ms":250,"public_sync_min_interval_ms":1500,"apple_account_keep_alive_enabled":true,"apple_account_keep_alive_ms":123000}`), 0600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"icloud_default_host":"legacy-host","mail_watcher_enabled":false,"mail_watcher_poll_ms":2500,"mail_watcher_fetch_limit":6,"mail_watcher_initial_fetch_limit":16,"mail_watcher_lookback_hours":12,"public_fast_sync_wait_ms":250,"public_sync_min_interval_ms":1500,"apple_account_keep_alive_enabled":true,"apple_account_keep_alive_ms":123000}`), 0600); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := LoadConfig(path)
@@ -293,6 +493,9 @@ func TestLoadConfigPublicCodeSyncSettings(t *testing.T) {
 	}
 	if !cfg.AppleAccountKeepAliveEnabled || cfg.AppleAccountKeepAliveMS != 123000 {
 		t.Fatalf("apple account keepalive settings = enabled:%t ms:%d, want true/123000", cfg.AppleAccountKeepAliveEnabled, cfg.AppleAccountKeepAliveMS)
+	}
+	if cfg.ICloudDefaultHost != "www.icloud.com" {
+		t.Fatalf("iCloud default host = %q, want www.icloud.com", cfg.ICloudDefaultHost)
 	}
 }
 
@@ -314,7 +517,7 @@ func TestAppleAccountOperationGateSerializesSameAccount(t *testing.T) {
 func TestICloudEndpointAddsProtocolQuery(t *testing.T) {
 	client := NewICloudClient()
 	got, err := client.endpoint(ICloudSession{
-		PremiumMailBaseURL: "https://p213-maildomainws.icloud.com.cn:443",
+		PremiumMailBaseURL: "https://p213-maildomainws.icloud.com:443",
 		DSID:               "123",
 		ClientID:           "cid",
 		ClientBuildNumber:  "build",
@@ -324,7 +527,7 @@ func TestICloudEndpointAddsProtocolQuery(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"https://p213-maildomainws.icloud.com.cn:443/v1/hme/generate?",
+		"https://p213-maildomainws.icloud.com:443/v1/hme/generate?",
 		"clientBuildNumber=build",
 		"clientMasteringNumber=master",
 		"clientId=cid",
@@ -337,19 +540,19 @@ func TestICloudEndpointAddsProtocolQuery(t *testing.T) {
 }
 
 func TestMailGatewayBaseURLFallback(t *testing.T) {
-	got, err := mailGatewayBaseURL(ICloudSession{MailBaseURL: "https://p213-mailws.icloud.com.cn:443"})
+	got, err := mailGatewayBaseURL(ICloudSession{MailBaseURL: "https://p213-mailws.icloud.com:443"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != "https://p213-mccgateway.icloud.com.cn:443" {
+	if got != "https://p213-mccgateway.icloud.com:443" {
 		t.Fatalf("mailGatewayBaseURL() = %q", got)
 	}
 
-	got, err = mailGatewayBaseURL(ICloudSession{PremiumMailBaseURL: "https://p213-maildomainws.icloud.com.cn:443"})
+	got, err = mailGatewayBaseURL(ICloudSession{PremiumMailBaseURL: "https://p213-maildomainws.icloud.com:443"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != "https://p213-mccgateway.icloud.com.cn:443" {
+	if got != "https://p213-mccgateway.icloud.com:443" {
 		t.Fatalf("mailGatewayBaseURL() from premium = %q", got)
 	}
 }
@@ -420,7 +623,7 @@ func TestPublicSessionIncludesLastCheckStatus(t *testing.T) {
 		DSID:              "1234567890",
 		IsICloudPlus:      true,
 		CanCreateHME:      true,
-		Cookies:           []SessionCookie{{Name: "session", Value: "x", Domain: ".icloud.com.cn", Path: "/"}},
+		Cookies:           []SessionCookie{{Name: "session", Value: "x", Domain: ".icloud.com", Path: "/"}},
 		LastCheckedAt:     checkedAt,
 		LastCheckOK:       false,
 		LastStatusMessage: "最近检测失败：请重新登录",
@@ -679,7 +882,7 @@ func TestStatusReturnsOwnerICloudSessionForAdminUser(t *testing.T) {
 		DSID:          "12345678908382",
 		IsICloudPlus:  true,
 		CanCreateHME:  true,
-		Cookies:       []SessionCookie{{Name: "session", Value: "x", Domain: ".icloud.com.cn", Path: "/"}},
+		Cookies:       []SessionCookie{{Name: "session", Value: "x", Domain: ".icloud.com", Path: "/"}},
 		LastCheckOK:   true,
 		LastCheckedAt: time.Now(),
 	}); err != nil {
@@ -1178,8 +1381,8 @@ func TestICloudClientRefreshAppleAccountManageStateUsesBootstrapTTLWhenInitialTo
 			w.Header().Set("scnt", "page-scnt")
 			_, _ = w.Write([]byte(`<html></html>`))
 		case "GET /bootstrap/portal":
-			if r.Header.Get("scnt") != "" {
-				t.Fatalf("bootstrap scnt header = %q, want empty", r.Header.Get("scnt"))
+			if r.Header.Get("scnt") != "page-scnt" {
+				t.Fatalf("bootstrap scnt header = %q, want page-scnt", r.Header.Get("scnt"))
 			}
 			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
 		case "GET /account/manage":
@@ -1218,6 +1421,104 @@ func TestICloudClientRefreshAppleAccountManageStateUsesBootstrapTTLWhenInitialTo
 	if strings.Join(paths, "\n") != strings.Join(wantPaths, "\n") {
 		t.Fatalf("paths = %#v, want %#v", paths, wantPaths)
 	}
+}
+
+func TestICloudClientRefreshAppleAccountManageStateRecoversAfterInitial502(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	var paths []string
+	tokenCalls := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.Method+" "+r.URL.Path)
+		switch r.Method + " " + r.URL.Path {
+		case "GET /account/manage/gs/ws/token":
+			tokenCalls++
+			switch tokenCalls {
+			case 1:
+				if r.Header.Get("scnt") != "auth-scnt" {
+					t.Fatalf("initial token scnt = %q, want auth-scnt", r.Header.Get("scnt"))
+				}
+				w.WriteHeader(http.StatusBadGateway)
+				_, _ = w.Write([]byte("<html><body>Apple 502 Bad Gateway</body></html>"))
+			case 2:
+				if r.Header.Get("scnt") != "page-scnt" {
+					t.Fatalf("recovery token scnt = %q, want page-scnt", r.Header.Get("scnt"))
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("scnt", "token-scnt")
+				http.SetCookie(w, &http.Cookie{Name: "token-cookie", Value: "ok", Path: "/"})
+				_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+			default:
+				t.Fatalf("unexpected token call %d", tokenCalls)
+			}
+		case "GET /account/manage/section/privacy":
+			if r.Header.Get("scnt") != "auth-scnt" {
+				t.Fatalf("privacy page scnt = %q, want auth-scnt", r.Header.Get("scnt"))
+			}
+			w.Header().Set("Content-Type", "text/html")
+			w.Header().Set("scnt", "page-scnt")
+			http.SetCookie(w, &http.Cookie{Name: "portal-cookie", Value: "ok", Path: "/"})
+			_, _ = w.Write([]byte("<html></html>"))
+		case "GET /bootstrap/portal":
+			if r.Header.Get("scnt") != "page-scnt" {
+				t.Fatalf("bootstrap scnt = %q, want page-scnt", r.Header.Get("scnt"))
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		case "GET /account/manage":
+			if r.Header.Get("scnt") != "token-scnt" {
+				t.Fatalf("manage scnt = %q, want token-scnt", r.Header.Get("scnt"))
+			}
+			if !strings.Contains(r.Header.Get("Cookie"), "portal-cookie=ok") || !strings.Contains(r.Header.Get("Cookie"), "token-cookie=ok") {
+				t.Fatalf("manage cookies = %q, want portal and token cookies", r.Header.Get("Cookie"))
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("scnt", "manage-scnt")
+			_, _ = w.Write([]byte(`{"apiKey":"account-key"}`))
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+	appleAccountManageBaseURL = ts.URL
+
+	client := &ICloudClient{client: ts.Client()}
+	state, err := client.RefreshAppleAccountManageState(t.Context(), LoginState{
+		Kind:    LoginStateAppleAccount,
+		Origin:  ts.URL,
+		Scnt:    "auth-scnt",
+		APIKey:  "old-key",
+		Cookies: []SessionCookie{{Name: "auth-cookie", Value: "ok", Domain: "127.0.0.1", Path: "/"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Scnt != "manage-scnt" || state.APIKey != "account-key" || !state.LastCheckOK {
+		t.Fatalf("state = %+v, want recovered management state", state)
+	}
+	if !hasSessionCookie(state.Cookies, "portal-cookie", "ok") || !hasSessionCookie(state.Cookies, "token-cookie", "ok") {
+		t.Fatalf("state cookies = %+v, want portal and token cookies", state.Cookies)
+	}
+	wantPaths := []string{
+		"GET /account/manage/gs/ws/token",
+		"GET /account/manage/section/privacy",
+		"GET /bootstrap/portal",
+		"GET /account/manage/gs/ws/token",
+		"GET /account/manage",
+	}
+	if strings.Join(paths, "\n") != strings.Join(wantPaths, "\n") {
+		t.Fatalf("paths = %#v, want %#v", paths, wantPaths)
+	}
+}
+
+func hasSessionCookie(cookies []SessionCookie, name, value string) bool {
+	for _, cookie := range cookies {
+		if cookie.Name == name && cookie.Value == value {
+			return true
+		}
+	}
+	return false
 }
 
 func TestICloudClientKeepAliveAppleAccountManageStateTouchesRealManageAPI(t *testing.T) {
@@ -1628,6 +1929,34 @@ func TestCheckSavedLoginStatesChecksAppleAccountState(t *testing.T) {
 	}
 }
 
+func TestCheckSavedLoginStatesChecksICloudWebStateWithoutMail(t *testing.T) {
+	var sawValidate bool
+	client := &ICloudClient{client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodPost || r.URL.Path != "/setup/ws/1/validate" {
+			t.Fatalf("unexpected iCloud validation request: %s %s", r.Method, r.URL.Path)
+		}
+		sawValidate = true
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"dsInfo":{"dsid":"123","appleId":"person@outlook.com","isHideMyEmailSubscriptionActive":true,"isHideMyEmailFeatureAvailable":true},"webservices":{"premiummailsettings":{"url":"https://p-maildomainws.icloud.com"},"mccgateway":{"url":"https://p-mccgateway.icloud.com"},"mail":{"url":"https://p-mailws.icloud.com"}}}`)),
+			Header:     make(http.Header),
+		}, nil
+	})}}
+	session, ok, err := checkSavedLoginStates(context.Background(), client, ICloudSession{
+		Cookies: []SessionCookie{{Name: "session", Value: "cookie", Domain: "setup.icloud.com", Path: "/"}},
+		LoginStates: []LoginState{{
+			Kind:    LoginStateICloudWeb,
+			Cookies: []SessionCookie{{Name: "session", Value: "cookie", Domain: "setup.icloud.com", Path: "/"}},
+		}},
+	}, time.Now())
+	if err != nil || !ok {
+		t.Fatalf("checkSavedLoginStates err=%v ok=%t", err, ok)
+	}
+	if !sawValidate || !session.LastCheckOK || !strings.Contains(session.LastStatusMessage, "旧接口正常") {
+		t.Fatalf("session check status = validate:%t ok:%t message:%q", sawValidate, session.LastCheckOK, session.LastStatusMessage)
+	}
+}
+
 func TestCheckSavedLoginStatesKeepsRecentlyHealthyAppleAccountState(t *testing.T) {
 	called := false
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1663,52 +1992,20 @@ func TestCheckSavedLoginStatesKeepsRecentlyHealthyAppleAccountState(t *testing.T
 	}
 }
 
-func TestAppleAuthClientPrimeAppleAccountManageStateKeepsChallengeScnt(t *testing.T) {
-	oldBaseURL := appleAccountManageBaseURL
-	defer func() { appleAccountManageBaseURL = oldBaseURL }()
-
-	var paths []string
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		paths = append(paths, r.Method+" "+r.URL.Path)
-		w.Header().Set("Content-Type", "application/json")
-		switch r.Method + " " + r.URL.Path {
-		case "GET /account/manage/section/privacy":
-			w.Header().Set("scnt", "page-scnt")
-			_, _ = w.Write([]byte(`<html></html>`))
-		case "GET /bootstrap/portal":
-			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
-		case "GET /account/manage/gs/ws/token":
-			if r.Header.Get("scnt") != "" {
-				t.Fatalf("pre-login token scnt header = %q, want empty", r.Header.Get("scnt"))
-			}
-			w.Header().Set("scnt", "manage-scnt")
-			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = w.Write([]byte(`{}`))
-		default:
-			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
-		}
-	}))
-	defer ts.Close()
-	appleAccountManageBaseURL = ts.URL
-
+func TestAppleAuthClientPrimeAppleAccountManageStateDoesNotRequireAnonymousPortal(t *testing.T) {
 	session := &appleAuthSession{
 		Endpoints: appleAccountManageAuthEndpoints(),
 		UserAgent: appleAccountManageUserAgent,
 	}
-	client := &AppleAuthClient{httpClient: ts.Client()}
+	client := &AppleAuthClient{httpClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		t.Fatalf("anonymous Apple Account portal request = %s %s", r.Method, r.URL.String())
+		return nil, errors.New("unexpected request")
+	})}}
 	if err := client.primeAppleAccountManageState(t.Context(), session); err != nil {
 		t.Fatal(err)
 	}
-	if session.ManageScnt != "manage-scnt" {
-		t.Fatalf("ManageScnt = %q, want manage-scnt", session.ManageScnt)
-	}
-	wantPaths := []string{
-		"GET /account/manage/section/privacy",
-		"GET /bootstrap/portal",
-		"GET /account/manage/gs/ws/token",
-	}
-	if strings.Join(paths, "\n") != strings.Join(wantPaths, "\n") {
-		t.Fatalf("paths = %#v, want %#v", paths, wantPaths)
+	if session.ManageScnt != "" {
+		t.Fatalf("ManageScnt = %q, want empty before authorization", session.ManageScnt)
 	}
 }
 
@@ -2292,8 +2589,8 @@ func TestICloudClientListPrivacyMailboxes(t *testing.T) {
 		if r.URL.Query().Get("dsid") != "123" {
 			t.Fatalf("dsid query = %q, want 123", r.URL.Query().Get("dsid"))
 		}
-		if r.Header.Get("Origin") != "https://www.icloud.com.cn" {
-			t.Fatalf("Origin = %q, want https://www.icloud.com.cn", r.Header.Get("Origin"))
+		if r.Header.Get("Origin") != "https://www.icloud.com" {
+			t.Fatalf("Origin = %q, want https://www.icloud.com", r.Header.Get("Origin"))
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
@@ -2317,7 +2614,7 @@ func TestICloudClientListPrivacyMailboxes(t *testing.T) {
 		ClientID:           "cid",
 		ClientBuildNumber:  "build",
 		MasteringNumber:    "master",
-		Host:               "www.icloud.com.cn",
+		Host:               "www.icloud.com",
 		Cookies:            []SessionCookie{{Name: "session", Value: "x", Domain: "127.0.0.1", Path: "/"}},
 	})
 	if err != nil {
@@ -3218,6 +3515,149 @@ func TestAdminDeleteUserRejectsSelfAndAdminAccounts(t *testing.T) {
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), "cannot_delete_admin_user") {
 		t.Fatalf("delete other admin = %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestDeleteICloudAccountCascadesLocalDataAndProxyAssignment(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{PublicBaseURL: "https://mail.example"}, store, discardLogger())
+	server := handler.(*Server)
+	userCookie, user := registerTestUser(t, handler, "alice", "alice123")
+	_, otherUser := registerTestUser(t, handler, "bob", "bob123")
+
+	target, err := store.AddAccountForOwner(user.ID, "Alice Apple", "alice@example.com", "local target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := store.AddAccountForOwner(otherUser.ID, "Bob Apple", "bob@example.com", "keep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveICloudSessionForOwner(user.ID, ICloudSession{
+		OwnerID:   user.ID,
+		AccountID: target.ID,
+		AppleID:   target.AppleID,
+		DSID:      "alice-dsid",
+		ProxyID:   "proxy-001",
+		Cookies:   []SessionCookie{{Name: "session", Value: "secret"}},
+		LoginStates: []LoginState{{
+			Kind:         LoginStateAppleAccount,
+			Host:         "appleid.apple.com",
+			Origin:       "https://account.apple.com",
+			Scnt:         "scnt-secret",
+			SessionToken: "token-secret",
+		}},
+		AppleLogin: &AppleLoginCredentials{
+			AppleID:  target.AppleID,
+			Password: "password-secret",
+			SMSLink:  "https://sms.example/code?key=secret",
+			ProxyID:  "proxy-001",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mailbox, err := store.AddMailboxForOwner(user.ID, target.ID, "ALICE", "alice-alias@icloud.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AddMessage(mailbox.ID, "Your OpenAI code is 123456", "noreply@example.com", "123456", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SaveCreateSettingsForOwner(user.ID, CreateSettings{
+		AccountIDs: []string{target.ID, other.ID, "keep"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	pool, err := NewProxyPool(ProxyPoolConfig{
+		Enabled: true,
+		Proxies: []ProxyEndpoint{
+			{ID: "proxy-001", URL: "socks5://user:pass@example.com:9000"},
+			{ID: "proxy-002", URL: "socks5://user:pass@example.net:9000"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyKey := proxyAccountKey(user.ID, target.AppleID)
+	if assigned, err := pool.Assign(proxyKey); err != nil || assigned != "proxy-001" {
+		t.Fatalf("assigned proxy = %q, err=%v; want proxy-001", assigned, err)
+	}
+	server.proxyPoolMu.Lock()
+	server.proxyPool = pool
+	server.proxyPoolErr = nil
+	server.proxyPoolMu.Unlock()
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/api/accounts/"+url.PathEscape(target.ID), nil)
+	req.AddCookie(userCookie)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("delete Apple account = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var body struct {
+		Deleted DeleteICloudAccountResult `json:"deleted"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Deleted.AccountID != target.ID || body.Deleted.ICloudSessions != 1 || body.Deleted.Mailboxes != 1 || body.Deleted.Messages != 1 || body.Deleted.CreateSettings != 1 {
+		t.Fatalf("deleted result = %+v", body.Deleted)
+	}
+	if got := pool.Assignment(proxyKey); got != "" {
+		t.Fatalf("proxy assignment after cleanup = %q, want empty", got)
+	}
+
+	state := store.Snapshot()
+	if len(state.Accounts) != 1 || state.Accounts[0].ID != other.ID {
+		t.Fatalf("accounts after delete = %+v", state.Accounts)
+	}
+	if len(state.Mailboxes) != 0 || len(state.Messages) != 0 {
+		t.Fatalf("associated data after delete mailboxes=%d messages=%d", len(state.Mailboxes), len(state.Messages))
+	}
+	if len(state.ICloudSessions) != 0 || state.ICloudSession != nil {
+		t.Fatalf("sessions after delete = scoped=%d legacy=%v", len(state.ICloudSessions), state.ICloudSession != nil)
+	}
+	if len(state.CreateSettings) != 1 || !reflect.DeepEqual(state.CreateSettings[0].AccountIDs, []string{other.ID, "keep"}) {
+		t.Fatalf("create settings after delete = %+v", state.CreateSettings)
+	}
+}
+
+func TestDeleteICloudAccountAccessControl(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{}, store, discardLogger())
+	adminCookie, _ := registerTestUser(t, handler, "admin", "admin123")
+	userCookie, _ := registerTestUser(t, handler, "alice", "alice123")
+	_, otherUser := registerTestUser(t, handler, "bob", "bob123")
+	account, err := store.AddAccountForOwner(otherUser.ID, "Bob Apple", "bob@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/api/accounts/"+url.PathEscape(account.ID), nil)
+	req.AddCookie(userCookie)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound || !strings.Contains(rr.Body.String(), "account_not_found") {
+		t.Fatalf("cross-user delete = %d body=%s, want 404 account_not_found", rr.Code, rr.Body.String())
+	}
+
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodDelete, "/api/accounts/"+url.PathEscape(account.ID), nil)
+	req.AddCookie(adminCookie)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("admin delete Apple account = %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodDelete, "/api/accounts/"+url.PathEscape(account.ID), nil)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("anonymous delete Apple account = %d body=%s, want 401", rr.Code, rr.Body.String())
+	}
+	if _, ok := store.FindAccountByID(account.ID); ok {
+		t.Fatalf("account %s still exists after admin deletion", account.ID)
 	}
 }
 

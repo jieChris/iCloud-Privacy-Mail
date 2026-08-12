@@ -674,6 +674,25 @@ func (s *Server) mailboxScheduler(ownerID string) *mailboxSchedulerJob {
 	return s.mailboxSchedulers[strings.TrimSpace(ownerID)]
 }
 
+func (s *Server) stopSchedulerForDeletedAccount(ownerID, accountID string) {
+	ownerID = strings.TrimSpace(ownerID)
+	accountID = strings.TrimSpace(accountID)
+	if ownerID == "" || accountID == "" {
+		return
+	}
+	job := s.mailboxScheduler(ownerID)
+	if job == nil {
+		return
+	}
+	state, _ := job.snapshot()
+	for _, selected := range state.AccountIDs {
+		if strings.TrimSpace(selected) == accountID {
+			job.stop("Apple 账号已删除，定时创建已停止")
+			return
+		}
+	}
+}
+
 func (s *Server) publicMailboxScheduler(r *http.Request) publicMailboxScheduler {
 	ownerID := requestOwnerID(r, s.store)
 	job := s.mailboxScheduler(ownerID)

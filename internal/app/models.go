@@ -105,36 +105,53 @@ type Message struct {
 }
 
 type ICloudSession struct {
-	OwnerID            string          `json:"owner_id,omitempty"`
-	AccountID          string          `json:"account_id,omitempty"`
-	SavedAt            time.Time       `json:"saved_at"`
-	AppleID            string          `json:"apple_id,omitempty"`
-	DSID               string          `json:"dsid"`
-	ClientID           string          `json:"client_id"`
-	ClientBuildNumber  string          `json:"client_build_number"`
-	MasteringNumber    string          `json:"client_mastering_number"`
-	PremiumMailBaseURL string          `json:"premium_mail_base_url"`
-	MailGatewayBaseURL string          `json:"mail_gateway_base_url,omitempty"`
-	MailBaseURL        string          `json:"mail_base_url,omitempty"`
-	Host               string          `json:"host"`
-	IsICloudPlus       bool            `json:"is_icloud_plus"`
-	CanCreateHME       bool            `json:"can_create_hme"`
-	Cookies            []SessionCookie `json:"cookies"`
-	LoginStates        []LoginState    `json:"login_states,omitempty"`
-	Note               string          `json:"note,omitempty"`
-	LastCheckedAt      time.Time       `json:"last_checked_at,omitempty"`
-	LastCheckOK        bool            `json:"last_check_ok,omitempty"`
-	LastStatusMessage  string          `json:"last_status_message,omitempty"`
+	OwnerID            string                 `json:"owner_id,omitempty"`
+	AccountID          string                 `json:"account_id,omitempty"`
+	ProxyID            string                 `json:"proxy_id,omitempty"`
+	SavedAt            time.Time              `json:"saved_at"`
+	AppleID            string                 `json:"apple_id,omitempty"`
+	DSID               string                 `json:"dsid"`
+	ClientID           string                 `json:"client_id"`
+	ClientBuildNumber  string                 `json:"client_build_number"`
+	MasteringNumber    string                 `json:"client_mastering_number"`
+	PremiumMailBaseURL string                 `json:"premium_mail_base_url"`
+	MailGatewayBaseURL string                 `json:"mail_gateway_base_url,omitempty"`
+	MailBaseURL        string                 `json:"mail_base_url,omitempty"`
+	Host               string                 `json:"host"`
+	IsICloudPlus       bool                   `json:"is_icloud_plus"`
+	CanCreateHME       bool                   `json:"can_create_hme"`
+	Cookies            []SessionCookie        `json:"cookies"`
+	LoginStates        []LoginState           `json:"login_states,omitempty"`
+	AppleLogin         *AppleLoginCredentials `json:"apple_login,omitempty"`
+	Note               string                 `json:"note,omitempty"`
+	LastCheckedAt      time.Time              `json:"last_checked_at,omitempty"`
+	LastCheckOK        bool                   `json:"last_check_ok,omitempty"`
+	LastStatusMessage  string                 `json:"last_status_message,omitempty"`
+}
+
+// AppleLoginCredentials are kept only for automatic re-login. They must not
+// be included in public session responses or runtime exports.
+type AppleLoginCredentials struct {
+	AppleID         string    `json:"apple_id,omitempty"`
+	Password        string    `json:"password,omitempty"`
+	ProxyID         string    `json:"proxy_id,omitempty"`
+	PhoneNumber     string    `json:"phone_number,omitempty"`
+	SMSLink         string    `json:"sms_link,omitempty"`
+	TwoFactorMethod string    `json:"two_factor_method,omitempty"`
+	UpdatedAt       time.Time `json:"updated_at,omitempty"`
 }
 
 type LoginState struct {
 	Kind              string          `json:"kind"`
+	ProxyID           string          `json:"proxy_id,omitempty"`
 	Host              string          `json:"host,omitempty"`
 	Origin            string          `json:"origin,omitempty"`
 	SavedAt           time.Time       `json:"saved_at,omitempty"`
 	Cookies           []SessionCookie `json:"cookies,omitempty"`
 	Scnt              string          `json:"scnt,omitempty"`
 	SessionID         string          `json:"session_id,omitempty"`
+	SessionToken      string          `json:"session_token,omitempty"`
+	AuthAttributes    string          `json:"auth_attributes,omitempty"`
 	APIKey            string          `json:"api_key,omitempty"`
 	DataAccessToken   string          `json:"data_access_token,omitempty"`
 	UserAgent         string          `json:"user_agent,omitempty"`
@@ -360,42 +377,43 @@ type publicUserSummary struct {
 }
 
 type publicICloudSession struct {
-	Saved                       bool   `json:"saved"`
-	AccountID                   string `json:"account_id,omitempty"`
-	SavedAt                     string `json:"saved_at,omitempty"`
-	AppleID                     string `json:"apple_id,omitempty"`
-	DSIDMask                    string `json:"dsid_mask,omitempty"`
-	ClientBuildNumber           string `json:"client_build_number,omitempty"`
-	MasteringNumber             string `json:"client_mastering_number,omitempty"`
-	PremiumMailBaseURL          string `json:"premium_mail_base_url,omitempty"`
-	MailGatewayBaseURL          string `json:"mail_gateway_base_url,omitempty"`
-	MailBaseURL                 string `json:"mail_base_url,omitempty"`
-	Host                        string `json:"host,omitempty"`
-	IsICloudPlus                bool   `json:"is_icloud_plus"`
-	CanCreateHME                bool   `json:"can_create_hme"`
-	CookieCount                 int    `json:"cookie_count"`
-	ICloudWebLoginSaved         bool   `json:"icloud_web_login_saved"`
-	ICloudWebLoginChecked       bool   `json:"icloud_web_login_checked"`
-	ICloudWebLoginOK            bool   `json:"icloud_web_login_ok"`
-	ICloudWebLoginStatus        string `json:"icloud_web_login_status,omitempty"`
-	AppleAccountLoginSaved      bool   `json:"apple_account_login_saved"`
-	AppleAccountLoginChecked    bool   `json:"apple_account_login_checked"`
-	AppleAccountLoginOK         bool   `json:"apple_account_login_ok"`
-	AppleAccountLoginStatus     string `json:"apple_account_login_status,omitempty"`
-	AppleAccountNextRefreshAt   string `json:"apple_account_next_refresh_at,omitempty"`
-	AppleAccountManageExpiresAt string `json:"apple_account_manage_expires_at,omitempty"`
-	AppleAccountManageReady     bool   `json:"apple_account_manage_ready"`
-	ICloudIMAPLoginSaved        bool   `json:"icloud_imap_login_saved"`
-	ICloudIMAPLoginChecked      bool   `json:"icloud_imap_login_checked"`
-	ICloudIMAPLoginOK           bool   `json:"icloud_imap_login_ok"`
-	ICloudIMAPLoginStatus       string `json:"icloud_imap_login_status,omitempty"`
-	ICloudIMAPEmail             string `json:"icloud_imap_email,omitempty"`
-	ICloudIMAPHost              string `json:"icloud_imap_host,omitempty"`
-	ProviderConfigured          bool   `json:"provider_configured"`
-	NeedsManualLogin            bool   `json:"needs_manual_login"`
-	LastCheckedAt               string `json:"last_checked_at,omitempty"`
-	LastCheckOK                 bool   `json:"last_check_ok"`
-	LastStatusMessage           string `json:"last_status_message,omitempty"`
+	Saved                        bool   `json:"saved"`
+	AccountID                    string `json:"account_id,omitempty"`
+	SavedAt                      string `json:"saved_at,omitempty"`
+	AppleID                      string `json:"apple_id,omitempty"`
+	DSIDMask                     string `json:"dsid_mask,omitempty"`
+	ClientBuildNumber            string `json:"client_build_number,omitempty"`
+	MasteringNumber              string `json:"client_mastering_number,omitempty"`
+	PremiumMailBaseURL           string `json:"premium_mail_base_url,omitempty"`
+	MailGatewayBaseURL           string `json:"mail_gateway_base_url,omitempty"`
+	MailBaseURL                  string `json:"mail_base_url,omitempty"`
+	Host                         string `json:"host,omitempty"`
+	IsICloudPlus                 bool   `json:"is_icloud_plus"`
+	CanCreateHME                 bool   `json:"can_create_hme"`
+	CookieCount                  int    `json:"cookie_count"`
+	ICloudWebLoginSaved          bool   `json:"icloud_web_login_saved"`
+	ICloudWebLoginChecked        bool   `json:"icloud_web_login_checked"`
+	ICloudWebLoginOK             bool   `json:"icloud_web_login_ok"`
+	ICloudWebLoginStatus         string `json:"icloud_web_login_status,omitempty"`
+	AppleAccountLoginSaved       bool   `json:"apple_account_login_saved"`
+	AppleAccountLoginChecked     bool   `json:"apple_account_login_checked"`
+	AppleAccountLoginOK          bool   `json:"apple_account_login_ok"`
+	AppleAccountLoginStatus      string `json:"apple_account_login_status,omitempty"`
+	AppleAccountNextRefreshAt    string `json:"apple_account_next_refresh_at,omitempty"`
+	AppleAccountManageExpiresAt  string `json:"apple_account_manage_expires_at,omitempty"`
+	AppleAccountManageReady      bool   `json:"apple_account_manage_ready"`
+	AppleLoginRecoveryConfigured bool   `json:"apple_login_recovery_configured"`
+	ICloudIMAPLoginSaved         bool   `json:"icloud_imap_login_saved"`
+	ICloudIMAPLoginChecked       bool   `json:"icloud_imap_login_checked"`
+	ICloudIMAPLoginOK            bool   `json:"icloud_imap_login_ok"`
+	ICloudIMAPLoginStatus        string `json:"icloud_imap_login_status,omitempty"`
+	ICloudIMAPEmail              string `json:"icloud_imap_email,omitempty"`
+	ICloudIMAPHost               string `json:"icloud_imap_host,omitempty"`
+	ProviderConfigured           bool   `json:"provider_configured"`
+	NeedsManualLogin             bool   `json:"needs_manual_login"`
+	LastCheckedAt                string `json:"last_checked_at,omitempty"`
+	LastCheckOK                  bool   `json:"last_check_ok"`
+	LastStatusMessage            string `json:"last_status_message,omitempty"`
 }
 
 type apiError struct {

@@ -10,28 +10,29 @@ import (
 )
 
 type Config struct {
-	ConfigPath                   string `json:"-"`
-	Host                         string `json:"host"`
-	Port                         int    `json:"port"`
-	DataPath                     string `json:"data_path"`
-	APIKey                       string `json:"api_key"`
-	PublicBaseURL                string `json:"public_base_url"`
-	ICloudDefaultHost            string `json:"icloud_default_host"`
-	ICloudClientID               string `json:"icloud_client_id"`
-	AppleAccountAPIKey           string `json:"apple_account_api_key"`
-	AppleAccountKeepAliveEnabled bool   `json:"apple_account_keep_alive_enabled"`
-	AppleAccountKeepAliveMS      int    `json:"apple_account_keep_alive_ms"`
-	MailWatcherEnabled           bool   `json:"mail_watcher_enabled"`
-	MailWatcherPollMS            int    `json:"mail_watcher_poll_ms"`
-	MailWatcherFetchLimit        int    `json:"mail_watcher_fetch_limit"`
-	MailWatcherInitialFetchLimit int    `json:"mail_watcher_initial_fetch_limit"`
-	MailWatcherLookbackHours     int    `json:"mail_watcher_lookback_hours"`
-	PublicFastSyncWaitMS         int    `json:"public_fast_sync_wait_ms"`
-	PublicSyncMinIntervalMS      int    `json:"public_sync_min_interval_ms"`
-	UpdateEnabled                bool   `json:"update_enabled"`
-	UpdateRepository             string `json:"update_repository"`
-	UpdateManifestURL            string `json:"update_manifest_url"`
-	UpdateAssetName              string `json:"update_asset_name"`
+	ConfigPath                   string          `json:"-"`
+	Host                         string          `json:"host"`
+	Port                         int             `json:"port"`
+	DataPath                     string          `json:"data_path"`
+	APIKey                       string          `json:"api_key"`
+	PublicBaseURL                string          `json:"public_base_url"`
+	ICloudDefaultHost            string          `json:"icloud_default_host"`
+	ICloudClientID               string          `json:"icloud_client_id"`
+	AppleAccountAPIKey           string          `json:"apple_account_api_key"`
+	AppleProxyPool               ProxyPoolConfig `json:"apple_proxy_pool"`
+	AppleAccountKeepAliveEnabled bool            `json:"apple_account_keep_alive_enabled"`
+	AppleAccountKeepAliveMS      int             `json:"apple_account_keep_alive_ms"`
+	MailWatcherEnabled           bool            `json:"mail_watcher_enabled"`
+	MailWatcherPollMS            int             `json:"mail_watcher_poll_ms"`
+	MailWatcherFetchLimit        int             `json:"mail_watcher_fetch_limit"`
+	MailWatcherInitialFetchLimit int             `json:"mail_watcher_initial_fetch_limit"`
+	MailWatcherLookbackHours     int             `json:"mail_watcher_lookback_hours"`
+	PublicFastSyncWaitMS         int             `json:"public_fast_sync_wait_ms"`
+	PublicSyncMinIntervalMS      int             `json:"public_sync_min_interval_ms"`
+	UpdateEnabled                bool            `json:"update_enabled"`
+	UpdateRepository             string          `json:"update_repository"`
+	UpdateManifestURL            string          `json:"update_manifest_url"`
+	UpdateAssetName              string          `json:"update_asset_name"`
 }
 
 func LoadConfig(path string) (Config, error) {
@@ -42,7 +43,7 @@ func LoadConfig(path string) (Config, error) {
 		DataPath:                     filepath.Join("data", "state.json"),
 		APIKey:                       strings.TrimSpace(os.Getenv("IPM_API_KEY")),
 		PublicBaseURL:                strings.TrimRight(strings.TrimSpace(os.Getenv("IPM_PUBLIC_BASE_URL")), "/"),
-		ICloudDefaultHost:            "www.icloud.com.cn",
+		ICloudDefaultHost:            "www.icloud.com",
 		ICloudClientID:               defaultAppleOAuthClientID,
 		AppleAccountAPIKey:           strings.TrimSpace(os.Getenv("IPM_APPLE_ACCOUNT_API_KEY")),
 		AppleAccountKeepAliveEnabled: envBool("APPLE_ACCOUNT_KEEP_ALIVE_ENABLED", true),
@@ -95,12 +96,15 @@ func LoadConfig(path string) (Config, error) {
 	if strings.TrimSpace(fromFile.ICloudDefaultHost) != "" {
 		cfg.ICloudDefaultHost = strings.TrimSpace(fromFile.ICloudDefaultHost)
 	}
+	// Apple/iCloud traffic is intentionally kept on the global .com endpoints.
+	cfg.ICloudDefaultHost = "www.icloud.com"
 	if strings.TrimSpace(fromFile.ICloudClientID) != "" {
 		cfg.ICloudClientID = strings.TrimSpace(fromFile.ICloudClientID)
 	}
 	if strings.TrimSpace(fromFile.AppleAccountAPIKey) != "" {
 		cfg.AppleAccountAPIKey = strings.TrimSpace(fromFile.AppleAccountAPIKey)
 	}
+	cfg.AppleProxyPool = fromFile.AppleProxyPool
 	if rawValue, ok := raw["apple_account_keep_alive_enabled"]; ok {
 		var enabled bool
 		if err := json.Unmarshal(rawValue, &enabled); err != nil {

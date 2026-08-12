@@ -207,6 +207,58 @@
       align-items: center;
       gap: 10px;
     }
+    .proxy-settings {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(160px, 1fr));
+      gap: 12px;
+      padding: 16px 18px;
+      border-bottom: 1px solid rgba(118,143,174,.16);
+    }
+    .proxy-field { display: grid; gap: 6px; }
+    .proxy-field.wide { grid-column: span 2; }
+    .proxy-field label { color: var(--muted); font-size: 12px; font-weight: 900; }
+    .proxy-field input, .proxy-field select, .proxy-field textarea {
+      width: 100%;
+      min-width: 0;
+      border: 1px solid var(--line-strong);
+      border-radius: 10px;
+      background: rgba(255,255,255,.92);
+      color: var(--text);
+      padding: 9px 10px;
+      outline: none;
+    }
+    .proxy-field textarea {
+      min-height: 76px;
+      resize: vertical;
+      line-height: 1.45;
+      font-family: var(--mono);
+    }
+    .proxy-field input:focus, .proxy-field select:focus, .proxy-field textarea:focus {
+      border-color: rgba(19,184,166,.62);
+      box-shadow: 0 0 0 4px rgba(19,184,166,.12);
+    }
+    .proxy-toggle {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 40px;
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 850;
+    }
+    .proxy-toggle input { width: 18px; height: 18px; accent-color: var(--green); }
+    .proxy-form {
+      display: grid;
+      grid-template-columns: 180px minmax(260px, 1fr) auto;
+      gap: 10px;
+      align-items: end;
+      padding: 16px 18px;
+      border-bottom: 1px solid rgba(118,143,174,.16);
+      background: rgba(248,251,255,.68);
+    }
+    .proxy-form .proxy-field small { color: var(--faint); font-size: 11px; line-height: 1.4; }
+    .proxy-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+    .proxy-table table { min-width: 760px; }
     .pager {
       display: flex;
       flex-wrap: wrap;
@@ -297,6 +349,8 @@
       .nav { grid-template-columns: 1fr 1fr; }
       h1 { font-size: 28px; }
       .stat-card strong { font-size: 30px; }
+      .proxy-settings, .proxy-form { grid-template-columns: 1fr; }
+      .proxy-field.wide { grid-column: span 1; }
     }
   </style>
 </head>
@@ -311,6 +365,7 @@
         <button class="active" data-view="overview" onclick="setActiveView('overview')"><span class="nav-icon">⌂</span>仪表盘</button>
         <button data-view="accountManage" onclick="setActiveView('accountManage')"><span class="nav-icon">▣</span>账号管理</button>
         <button data-view="users" onclick="setActiveView('users')"><span class="nav-icon">◉</span>用户列表</button>
+        <button data-view="proxyPool" id="proxyPoolNav" hidden onclick="setActiveView('proxyPool')"><span class="nav-icon">◇</span>代理池</button>
         <button data-view="mailboxes" onclick="setActiveView('mailboxes')"><span class="nav-icon">✉</span>隐私邮箱</button>
         <button data-view="accounts" onclick="setActiveView('accounts')"><span class="nav-icon">◎</span>登录账号</button>
         <button data-view="logs" onclick="setActiveView('logs')"><span class="nav-icon">☰</span>运行日志</button>
@@ -380,6 +435,38 @@
           <div class="empty" id="usersEmpty" hidden>暂无用户数据</div>
         </section>
 
+        <section class="panel view-section" id="proxyPoolPanel" data-view="proxyPool">
+          <div class="panel-head">
+            <div><h2>Apple 代理池</h2><p>管理员可在此维护 SOCKS5 节点。账号会按代理 ID 保持绑定，代理故障后才会重新分配。</p></div>
+            <div class="panel-tools"><span id="proxyPoolStatus" class="muted">正在读取...</span></div>
+          </div>
+          <div class="proxy-settings">
+            <div class="proxy-field"><label for="proxyPoolEnabled">代理池状态</label><label class="proxy-toggle"><input id="proxyPoolEnabled" type="checkbox">启用代理池</label></div>
+            <div class="proxy-field"><label for="proxyPoolStrategy">分配策略</label><select id="proxyPoolStrategy"><option value="round_robin">round_robin（轮询）</option></select></div>
+            <div class="proxy-field wide"><label for="proxyHealthURL">健康检查地址</label><input id="proxyHealthURL" type="url" placeholder="https://www.icloud.com/"></div>
+            <div class="proxy-field"><label for="proxyHealthTimeout">检查超时（毫秒）</label><input id="proxyHealthTimeout" type="number" min="1000" max="120000"></div>
+            <div class="proxy-field"><label for="proxyCooldown">故障隔离（毫秒）</label><input id="proxyCooldown" type="number" min="1000" max="86400000"></div>
+            <div class="proxy-field"><label for="proxyMaxFailures">连续失败次数</label><input id="proxyMaxFailures" type="number" min="1" max="20"></div>
+            <div class="proxy-actions" style="grid-column:1/-1"><button class="btn primary" onclick="saveProxyPoolSettings()">保存代理池设置</button><button class="btn" onclick="loadProxyPool()">重新读取</button></div>
+          </div>
+          <div class="proxy-form">
+            <div class="proxy-field"><label for="proxyID">代理 ID（可选）</label><input id="proxyID" type="text" maxlength="100" placeholder="留空自动生成"></div>
+            <div class="proxy-field"><label for="proxyURL">单个 SOCKS5 地址</label><input id="proxyURL" type="text" placeholder="账号:密码@地址:端口"><small>也支持 socks5:// 或 socks5h://；编辑已有节点时地址留空表示保留原凭据。</small></div>
+            <div class="proxy-actions"><button class="btn primary" onclick="saveProxyEndpoint()">保存节点</button><button class="btn" onclick="testProxy()">测试连接</button><button class="btn" onclick="clearProxyForm()">清空</button></div>
+          </div>
+          <div class="proxy-form">
+            <div class="proxy-field" style="grid-column:1/-1"><label for="proxyBatchText">批量导入（一行一个代理）</label><textarea id="proxyBatchText" placeholder="账号1:密码1@地址1:端口1&#10;账号2:密码2@地址2:端口2"></textarea><small>支持裸格式和 socks5://、socks5h:// 前缀；空行和 # 开头的行会跳过。</small></div>
+            <div class="proxy-actions" style="grid-column:1/-1"><button class="btn primary" onclick="importProxyBatch()">批量导入</button><button class="btn" onclick="clearProxyBatch()">清空批量内容</button></div>
+          </div>
+          <div class="table-wrap proxy-table">
+            <table>
+              <thead><tr><th>ID</th><th>地址（脱敏）</th><th>认证</th><th>状态</th><th>失败次数</th><th>操作</th></tr></thead>
+              <tbody id="proxyRows"></tbody>
+            </table>
+          </div>
+          <div class="empty" id="proxyRowsEmpty" hidden>暂无代理节点。先填写上方表单并保存。</div>
+        </section>
+
         <section class="panel view-section" id="mailboxesPanel" data-view="mailboxes">
           <div class="panel-head">
             <div><h2>隐私邮箱数据</h2><p>当前账号有权限查看的隐私邮箱。</p></div>
@@ -410,7 +497,7 @@
           </div>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>ID</th><th>归属</th><th>标签</th><th>Apple ID</th><th>状态</th><th>备注</th><th>创建时间</th></tr></thead>
+              <thead><tr><th>ID</th><th>归属</th><th>标签</th><th>Apple ID</th><th>状态</th><th>备注</th><th>创建时间</th><th>操作</th></tr></thead>
               <tbody id="accounts"></tbody>
             </table>
           </div>
@@ -447,6 +534,7 @@
       users: '用户列表',
       mailboxes: '隐私邮箱',
       accounts: '登录账号',
+      proxyPool: '代理池',
       logs: '运行日志'
     };
 
@@ -583,6 +671,8 @@
       if (!data.authenticated) { location.href = '/login'; throw new Error('未登录'); }
       currentUser = data.user;
       $('whoami').textContent = `当前账号：${currentUser.username}${currentUser.is_admin ? ' / 管理员，可查看全部数据' : ' / 普通用户，仅查看自己数据'}`;
+      if ($('proxyPoolNav')) $('proxyPoolNav').hidden = !currentUser.is_admin;
+      if (!currentUser.is_admin && localStorage.getItem(viewStorageKey) === 'proxyPool') setActiveView('overview');
     }
     function renderEmpty(id, rows) {
       const empty = $(id + 'Empty');
@@ -591,7 +681,99 @@
     async function refresh() {
       manageData = await api('/api/manage/data');
       renderData();
+      if (currentUser && currentUser.is_admin) await loadProxyPool(false);
       log('数据已刷新');
+    }
+    async function loadProxyPool(shouldLog=true) {
+      if (!currentUser || !currentUser.is_admin) return;
+      const data = await api('/api/admin/proxy-pool');
+      $('proxyPoolEnabled').checked = !!data.enabled;
+      $('proxyPoolStrategy').value = data.strategy || 'round_robin';
+      $('proxyHealthURL').value = data.health_check_url || '';
+      $('proxyHealthTimeout').value = data.health_check_timeout_ms || 12000;
+      $('proxyCooldown').value = data.failure_cooldown_ms || 120000;
+      $('proxyMaxFailures').value = data.max_failures || 2;
+      const status = data.configured ? (data.enabled ? '已启用' : '已停用') : '配置错误';
+      $('proxyPoolStatus').innerHTML = `${pill(status, data.configured ? (data.enabled ? '' : 'gray') : 'red')} ${esc(data.config_error || '')}`;
+      const rows = data.proxies || [];
+      $('proxyRows').innerHTML = rows.map(proxy => `
+        <tr>
+          <td class="mono">${esc(proxy.id)}</td>
+          <td class="mono">${esc(proxy.url_masked || '-')}</td>
+          <td>${proxy.has_credentials ? pill('用户名密码') : pill('无认证', 'gray')}</td>
+          <td>${proxy.available ? pill('可用') : pill(proxy.quarantined_until ? '隔离中' : '不可用', proxy.quarantined_until ? 'amber' : 'red')}</td>
+          <td>${proxy.failure_count || 0}</td>
+          <td><div class="proxy-actions"><button class="btn small" onclick="editProxy('${esc(proxy.id)}')">编辑</button><button class="btn small" onclick="testProxy('${esc(proxy.id)}')">测试</button><button class="btn small danger" onclick="deleteProxy('${esc(proxy.id)}')">删除</button></div></td>
+        </tr>`).join('');
+      renderEmpty('proxyRows', rows);
+      if (shouldLog) log('代理池配置已读取');
+    }
+    async function saveProxyPoolSettings() {
+      try {
+        await api('/api/admin/proxy-pool', {method:'PUT', body:JSON.stringify({
+          enabled: $('proxyPoolEnabled').checked,
+          strategy: $('proxyPoolStrategy').value,
+          health_check_url: $('proxyHealthURL').value.trim(),
+          health_check_timeout_ms: Number($('proxyHealthTimeout').value),
+          failure_cooldown_ms: Number($('proxyCooldown').value),
+          max_failures: Number($('proxyMaxFailures').value)
+        })});
+        await loadProxyPool(false);
+        log('代理池设置已保存并立即生效');
+      } catch (err) { log('保存代理池设置失败：' + err.message); }
+    }
+    async function saveProxyEndpoint() {
+      const id = $('proxyID').value.trim();
+      const url = $('proxyURL').value.trim();
+      if (!url && !id) { log('保存代理节点失败：请填写代理地址'); return; }
+      try {
+        await api('/api/admin/proxy-pool/proxies', {method:'POST', body:JSON.stringify({id, url})});
+        clearProxyForm();
+        await loadProxyPool(false);
+        log('代理节点已保存并立即生效' + (id ? '：' + id : '，ID 已自动生成'));
+      } catch (err) { log('保存代理节点失败：' + err.message); }
+    }
+    async function importProxyBatch() {
+      const text = $('proxyBatchText').value.trim();
+      if (!text) { log('批量导入失败：请填写代理地址'); return; }
+      try {
+        const data = await api('/api/admin/proxy-pool/proxies/batch', {method:'POST', body:JSON.stringify({text})});
+        const failed = data.failed || [];
+        const detail = failed.length ? `；失败 ${failed.length} 行：${failed.map(item => '第' + item.line + '行 ' + item.message).join('；')}` : '';
+        clearProxyBatch();
+        await loadProxyPool(false);
+        log((data.message || '批量导入完成') + detail);
+      } catch (err) { log('批量导入失败：' + err.message); }
+    }
+    function clearProxyBatch() {
+      $('proxyBatchText').value = '';
+    }
+    function editProxy(id) {
+      $('proxyID').value = id || '';
+      $('proxyURL').value = '';
+      $('proxyURL').focus();
+      log('已选择代理节点 ' + id + '；地址留空则保留原凭据');
+    }
+    function clearProxyForm() {
+      $('proxyID').value = '';
+      $('proxyURL').value = '';
+    }
+    async function testProxy(id='') {
+      const proxyID = id || $('proxyID').value.trim();
+      const proxyURL = id ? '' : $('proxyURL').value.trim();
+      if (!proxyID && !proxyURL) { log('测试代理失败：请填写代理 ID 或地址'); return; }
+      try {
+        const data = await api('/api/admin/proxy-pool/test', {method:'POST', body:JSON.stringify({id:proxyID, url:proxyURL})});
+        log(data.message || '代理连接测试成功');
+      } catch (err) { log('代理连接测试失败：' + err.message); }
+    }
+    async function deleteProxy(id) {
+      if (!id || !confirm('确定删除代理节点「' + id + '」吗？')) return;
+      try {
+        await api('/api/admin/proxy-pool/' + encodeURIComponent(id), {method:'DELETE'});
+        await loadProxyPool(false);
+        log('代理节点已删除：' + id);
+      } catch (err) { log('删除代理节点失败：' + err.message); }
     }
     async function deleteUser(id) {
       if (!currentUser || !currentUser.is_admin) return;
@@ -604,6 +786,20 @@
       await refresh();
       const deleted = data.deleted || {};
       log(`已删除账号：${name}；清理邮箱 ${deleted.mailboxes || 0} 个，验证码 ${deleted.messages || 0} 封`);
+    }
+    async function deleteAccount(id) {
+      if (!id) return;
+      const account = (manageData && manageData.accounts || []).find(item => item.id === id) || {};
+      const name = account.apple_id || account.label || id;
+      if (!confirm(`确定删除 Apple 账号「${name}」吗？只删除本地保存的数据，不会删除 Apple 远端账号；登录态、自动重登录凭据、关联隐私邮箱和验证码邮件会一并清理。`)) return;
+      try {
+        const data = await api('/api/accounts/' + encodeURIComponent(id), {method:'DELETE'});
+        await refresh();
+        const deleted = data.deleted || {};
+        log(`已删除 Apple 账号：${name}；清理登录态 ${deleted.icloud_sessions || 0} 个、邮箱 ${deleted.mailboxes || 0} 个、验证码 ${deleted.messages || 0} 封`);
+      } catch (err) {
+        log('删除 Apple 账号失败：' + err.message);
+      }
     }
     function renderData() {
       const data = manageData || {};
@@ -688,6 +884,7 @@
           <td>${statusPill(a.status)} ${statusPill(a.icloud_status)}</td>
           <td>${esc(a.note || '-')}</td>
           <td>${esc(a.created_at || '-')}</td>
+          <td><button class="btn small danger" onclick="deleteAccount('${esc(a.id)}'); event.stopPropagation();">删除</button></td>
         </tr>`).join('');
       renderEmpty('accounts', accounts);
       renderMailboxExportAccountOptions(accounts, mailboxes);

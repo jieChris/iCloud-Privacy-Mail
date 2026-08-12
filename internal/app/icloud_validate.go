@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 )
 
@@ -32,15 +31,34 @@ func NewICloudSessionValidator() *ICloudSessionValidator {
 	return &ICloudSessionValidator{httpClient: &http.Client{Timeout: 15 * time.Second}}
 }
 
-func (c *ICloudSessionValidator) Validate(ctx context.Context, cookies []SessionCookie, defaultHost string) (validateResult, error) {
-	host := strings.TrimSpace(defaultHost)
-	if host == "" {
-		host = "www.icloud.com.cn"
+func (c *ICloudClient) ValidateICloudWebSession(ctx context.Context, session ICloudSession) (ICloudSession, error) {
+	if !iCloudWebLoginSaved(session) {
+		return session, errCode("icloud_session_missing", "未保存 iCloud 登录态，请先协议登录", true)
 	}
-	setupHost := "setup.icloud.com.cn"
-	if strings.HasSuffix(host, "icloud.com") && !strings.HasSuffix(host, "icloud.com.cn") {
-		setupHost = "setup.icloud.com"
+	validator := NewICloudSessionValidator()
+	if c != nil && c.client != nil {
+		validator.httpClient = c.client
 	}
+	validated, err := validator.Validate(ctx, session.Cookies, session.Host)
+	if err != nil {
+		return session, err
+	}
+	session.AppleID = firstNonEmpty(validated.AppleID, session.AppleID)
+	session.DSID = firstNonEmpty(validated.DSID, session.DSID)
+	session.ClientID = firstNonEmpty(validated.ClientID, session.ClientID)
+	session.ClientBuildNumber = firstNonEmpty(validated.ClientBuildNumber, session.ClientBuildNumber)
+	session.MasteringNumber = firstNonEmpty(validated.MasteringNumber, session.MasteringNumber)
+	session.PremiumMailBaseURL = firstNonEmpty(validated.PremiumMailBaseURL, session.PremiumMailBaseURL)
+	session.MailGatewayBaseURL = firstNonEmpty(validated.MailGatewayBaseURL, session.MailGatewayBaseURL)
+	session.MailBaseURL = firstNonEmpty(validated.MailBaseURL, session.MailBaseURL)
+	session.IsICloudPlus = validated.IsICloudPlus || session.IsICloudPlus
+	session.CanCreateHME = validated.CanCreateHME || session.CanCreateHME
+	return session, nil
+}
+
+func (c *ICloudSessionValidator) Validate(ctx context.Context, cookies []SessionCookie, _ string) (validateResult, error) {
+	host := "www.icloud.com"
+	setupHost := "setup.icloud.com"
 
 	clientID, err := randomUUID()
 	if err != nil {

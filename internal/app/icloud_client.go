@@ -53,6 +53,13 @@ func NewICloudClient() *ICloudClient {
 	return &ICloudClient{client: &http.Client{Timeout: 30 * time.Second}}
 }
 
+func NewICloudClientWithHTTPClient(client *http.Client) *ICloudClient {
+	if client == nil {
+		return NewICloudClient()
+	}
+	return &ICloudClient{client: client}
+}
+
 const mailboxSyncCursorOverlap = 2 * time.Minute
 const appleAccountManageRefreshSkew = 0 * time.Second
 const appleAccountKeepAliveDefaultInterval = 4 * time.Minute
@@ -66,28 +73,20 @@ const (
 	appleAccountManageOrigin     = "https://account.apple.com"
 	appleAccountManageUserAgent  = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
 	appleAccountManageRequestCtx = "ca"
-	appleAccountManageLanguage   = "zh"
-	appleAccountManageTimeZone   = "Asia/Shanghai"
-	appleAccountManageGMTOffset  = "GMT+08:00"
+	appleAccountManageLanguage   = "en-US"
+	appleAccountManageTimeZone   = "America/Chicago"
+	appleAccountManageGMTOffset  = "GMT-05:00"
 	appleAccountManagePlatform   = `"macOS"`
-	appleAccountManageTZOffset   = 8 * 60 * 60
+	appleAccountManageTZOffset   = -5 * 60 * 60
 )
 
 const appleAccountHTTPStatusSessionTimeout = 419
 
-func appleAccountManageHostForICloudHost(host string) string {
-	host = strings.ToLower(strings.TrimSpace(host))
-	if strings.Contains(host, "appleid.apple.com.cn") {
-		return "appleid.apple.com.cn"
-	}
+func appleAccountManageHostForICloudHost(_ string) string {
 	return "appleid.apple.com"
 }
 
-func appleAccountManageOriginForHost(host string) string {
-	host = strings.ToLower(strings.TrimSpace(host))
-	if strings.Contains(host, "account.apple.com.cn") || strings.Contains(host, "appleid.apple.com.cn") {
-		return "https://account.apple.com.cn"
-	}
+func appleAccountManageOriginForHost(_ string) string {
 	return appleAccountManageOrigin
 }
 
@@ -99,25 +98,15 @@ func appleAccountManageBaseForState(state LoginState) string {
 	if strings.TrimRight(baseURL, "/") != "https://appleid.apple.com" {
 		return baseURL
 	}
-	host := strings.TrimSpace(state.Host)
-	if host == "" {
-		return baseURL
-	}
-	host = strings.TrimPrefix(host, "https://")
-	host = strings.TrimPrefix(host, "http://")
-	host = strings.Trim(host, "/")
-	if host == "" {
-		return baseURL
-	}
-	return "https://" + host
+	return "https://appleid.apple.com"
 }
 
 func appleAccountPortalBaseForState(state LoginState) string {
 	baseURL := strings.TrimSpace(appleAccountManageBaseURL)
-	if baseURL != "" && strings.TrimRight(baseURL, "/") != "https://appleid.apple.com" {
-		return baseURL
+	if baseURL == "" {
+		return "https://appleid.apple.com"
 	}
-	return strings.TrimRight(firstNonEmpty(state.Origin, appleAccountManageOriginForHost(state.Host), appleAccountManageOrigin), "/")
+	return strings.TrimRight(baseURL, "/")
 }
 
 func appleAccountLoginState(session ICloudSession) (LoginState, bool) {
@@ -422,61 +411,86 @@ func appleAccountKeepAliveDue(loginState LoginState, now time.Time, interval tim
 }
 
 func (c *ICloudClient) refreshAppleAccountManageStateUnlocked(ctx context.Context, loginState LoginState) (LoginState, error) {
-	if strings.TrimSpace(loginState.Scnt) == "" {
+	originalScnt := strings.TrimSpace(loginState.Scnt)
+	if originalScnt == "" {
 		return loginState, errCode("apple_account_session_missing", "当前登录态缺少 Apple Account 管理态，请重新协议登录", true)
+	}
+	cloneState := func(state LoginState) LoginState {
+		state.Cookies = append([]SessionCookie(nil), state.Cookies...)
+		return state
 	}
 	var token struct {
 		TimeOutInterval int `json:"timeOutInterval"`
 	}
-	if err := c.callAppleAccount(ctx, &loginState, "", http.MethodGet, "/account/manage/gs/ws/token", nil, &token); err != nil {
-		return loginState, err
-	}
-	markAppleAccountManageTokenTTL(&loginState, token.TimeOutInterval, time.Now())
-	if token.TimeOutInterval <= 0 {
-		if err := c.warmAppleAccountPortal(ctx, &loginState); err == nil {
-			token = struct {
-				TimeOutInterval int `json:"timeOutInterval"`
-			}{}
-			withoutScnt := loginState
-			withoutScnt.Scnt = ""
-			if err := c.callAppleAccount(ctx, &withoutScnt, "", http.MethodGet, "/account/manage/gs/ws/token", nil, &token); err == nil {
-				loginState = withoutScnt
-				markAppleAccountManageTokenTTL(&loginState, token.TimeOutInterval, time.Now())
-			} else if err := c.callAppleAccount(ctx, &loginState, "", http.MethodGet, "/account/manage/gs/ws/token", nil, &token); err == nil {
-				markAppleAccountManageTokenTTL(&loginState, token.TimeOutInterval, time.Now())
+	firstState := cloneState(loginState)
+	firstErr := c.callAppleAccount(ctx, &firstState, "", http.MethodGet, "/account/manage/gs/ws/token", nil, &token)
+	if firstErr == nil {
+		markAppleAccountManageTokenTTL(&firstState, token.TimeOutInterval, time.Now())
+		if token.TimeOutInterval > 0 {
+			if err := c.loadAppleAccountManageAPIKey(ctx, &firstState); err == nil {
+				markAppleAccountManageOK(&firstState)
+				return firstState, nil
+			} else {
+				firstErr = err
 			}
 		}
 	}
-	tokenScnt := strings.TrimSpace(loginState.Scnt)
-	if err := c.loadAppleAccountManageAPIKey(ctx, &loginState); err == nil {
-		markAppleAccountManageOK(&loginState)
-		return loginState, nil
+
+	// A token request immediately after 2FA can still carry the auth-phase
+	// scnt. The management page creates the scnt required by the token API.
+	portalState := firstState
+	if firstErr == nil && token.TimeOutInterval <= 0 {
+		// The browser drops the token response scnt before refreshing the
+		// portal when the first response has no TTL.
+		portalState.Scnt = ""
 	}
-	if err := c.warmAppleAccountPortal(ctx, &loginState); err != nil {
+	if err := c.warmAppleAccountPortal(ctx, &portalState); err != nil {
+		if firstErr != nil {
+			return loginState, firstErr
+		}
 		return loginState, err
 	}
-	withoutScnt := loginState
-	withoutScnt.Scnt = ""
-	if err := c.callAppleAccount(ctx, &withoutScnt, "", http.MethodGet, "/account/manage/gs/ws/token", nil, &token); err == nil {
-		markAppleAccountManageTokenTTL(&withoutScnt, token.TimeOutInterval, time.Now())
-		loginState = withoutScnt
-	} else if err := c.callAppleAccount(ctx, &loginState, "", http.MethodGet, "/account/manage/gs/ws/token", nil, &token); err != nil {
-		if tokenScnt == "" {
-			return loginState, err
-		}
-		loginState.Scnt = tokenScnt
-		if retryErr := c.callAppleAccount(ctx, &loginState, "", http.MethodGet, "/account/manage/gs/ws/token", nil, &token); retryErr != nil {
-			return loginState, err
-		}
-		markAppleAccountManageTokenTTL(&loginState, token.TimeOutInterval, time.Now())
-	} else {
-		markAppleAccountManageTokenTTL(&loginState, token.TimeOutInterval, time.Now())
+
+	pageScnt := strings.TrimSpace(portalState.Scnt)
+	// Keep the historical empty-scnt retry for a token response without a TTL;
+	// a 502 on the first request uses the page scnt first as in the browser.
+	scntCandidates := []string{pageScnt, "", originalScnt}
+	if firstErr == nil && token.TimeOutInterval <= 0 {
+		scntCandidates = []string{"", originalScnt, pageScnt}
 	}
-	if err := c.loadAppleAccountManageAPIKey(ctx, &loginState); err != nil {
-		return loginState, err
+	seenScnt := make(map[string]struct{}, len(scntCandidates))
+	lastErr := firstErr
+	for _, scnt := range scntCandidates {
+		if _, seen := seenScnt[scnt]; seen {
+			continue
+		}
+		seenScnt[scnt] = struct{}{}
+		candidate := cloneState(portalState)
+		candidate.Scnt = scnt
+		token = struct {
+			TimeOutInterval int `json:"timeOutInterval"`
+		}{}
+		if err := c.callAppleAccount(ctx, &candidate, "", http.MethodGet, "/account/manage/gs/ws/token", nil, &token); err != nil {
+			lastErr = err
+			continue
+		}
+		markAppleAccountManageTokenTTL(&candidate, token.TimeOutInterval, time.Now())
+		if err := c.loadAppleAccountManageAPIKey(ctx, &candidate); err != nil {
+			lastErr = err
+			continue
+		}
+		// An empty-scnt request may succeed without returning a replacement;
+		// retain the authenticated scnt so the saved state remains refreshable.
+		if strings.TrimSpace(candidate.Scnt) == "" {
+			candidate.Scnt = originalScnt
+		}
+		markAppleAccountManageOK(&candidate)
+		return candidate, nil
 	}
-	markAppleAccountManageOK(&loginState)
-	return loginState, nil
+	if firstErr != nil {
+		return loginState, firstErr
+	}
+	return loginState, lastErr
 }
 
 func appleAccountOperationKey(session ICloudSession, loginState LoginState) string {
@@ -523,11 +537,17 @@ func (c *ICloudClient) loadAppleAccountManageAPIKey(ctx context.Context, loginSt
 }
 
 func (c *ICloudClient) warmAppleAccountPortal(ctx context.Context, loginState *LoginState) error {
+	privacyErr := error(nil)
 	if _, err := c.callAppleAccountPortal(ctx, loginState, "/account/manage/section/privacy", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7", false, "document", "navigate"); err != nil {
-		return err
+		// Apple can return 502 for this document while the authenticated
+		// bootstrap endpoint remains usable. Keep recovering the API state.
+		privacyErr = err
 	}
 	data, err := c.callAppleAccountPortal(ctx, loginState, "/bootstrap/portal", "application/json, text/plain, */*", true, "empty", "cors")
 	if err != nil {
+		if privacyErr != nil {
+			return privacyErr
+		}
 		return err
 	}
 	var portal struct {
@@ -580,6 +600,22 @@ func (c *ICloudClient) callAppleAccountPortalOnce(ctx context.Context, loginStat
 	req.Header.Set("Sec-CH-UA-Platform", appleAccountManagePlatform)
 	req.Header.Set("Sec-CH-UA", `"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"`)
 	req.Header.Set("Sec-CH-UA-Mobile", "?0")
+	req.Header.Set("X-Apple-App-Id", appleAccountManageOAuthClientID)
+	req.Header.Set("X-Apple-Domain-Id", "11")
+	req.Header.Set("X-Apple-Privacy-Consent", "true")
+	req.Header.Set("X-Apple-Privacy-Consent-Accepted", "true")
+	if scnt := strings.TrimSpace(loginState.Scnt); scnt != "" {
+		req.Header.Set("scnt", scnt)
+	}
+	if sessionID := strings.TrimSpace(loginState.SessionID); sessionID != "" {
+		req.Header.Set("X-Apple-ID-Session-Id", sessionID)
+	}
+	if sessionToken := strings.TrimSpace(loginState.SessionToken); sessionToken != "" {
+		req.Header.Set("X-Apple-Session-Token", sessionToken)
+	}
+	if authAttributes := strings.TrimSpace(loginState.AuthAttributes); authAttributes != "" {
+		req.Header.Set("X-Apple-Auth-Attributes", authAttributes)
+	}
 	if cookie := cookieHeader(loginState.Cookies, rawURL); cookie != "" {
 		req.Header.Set("Cookie", cookie)
 	}
@@ -747,6 +783,22 @@ func (c *ICloudClient) fetchAppleAccountManageTokenScntOnce(ctx context.Context,
 	req.Header.Set("Sec-CH-UA-Platform", appleAccountManagePlatform)
 	req.Header.Set("Sec-CH-UA", `"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"`)
 	req.Header.Set("Sec-CH-UA-Mobile", "?0")
+	req.Header.Set("X-Apple-App-Id", appleAccountManageOAuthClientID)
+	req.Header.Set("X-Apple-Domain-Id", "11")
+	req.Header.Set("X-Apple-Privacy-Consent", "true")
+	req.Header.Set("X-Apple-Privacy-Consent-Accepted", "true")
+	if scnt := strings.TrimSpace(loginState.Scnt); scnt != "" {
+		req.Header.Set("scnt", scnt)
+	}
+	if sessionID := strings.TrimSpace(loginState.SessionID); sessionID != "" {
+		req.Header.Set("X-Apple-ID-Session-Id", sessionID)
+	}
+	if sessionToken := strings.TrimSpace(loginState.SessionToken); sessionToken != "" {
+		req.Header.Set("X-Apple-Session-Token", sessionToken)
+	}
+	if authAttributes := strings.TrimSpace(loginState.AuthAttributes); authAttributes != "" {
+		req.Header.Set("X-Apple-Auth-Attributes", authAttributes)
+	}
 	req.Header.Set("X-Apple-I-FD-Client-Info", appleAccountFDClientInfo(userAgent))
 	req.Header.Set("X-Apple-I-Request-Context", appleAccountManageRequestCtx)
 	req.Header.Set("X-Apple-I-TimeZone", appleAccountManageTimeZone)
@@ -825,8 +877,21 @@ func (c *ICloudClient) callAppleAccountRawOnce(ctx context.Context, loginState *
 	req.Header.Set("Sec-CH-UA-Platform", appleAccountManagePlatform)
 	req.Header.Set("Sec-CH-UA", `"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"`)
 	req.Header.Set("Sec-CH-UA-Mobile", "?0")
+	req.Header.Set("X-Apple-App-Id", appleAccountManageOAuthClientID)
+	req.Header.Set("X-Apple-Domain-Id", "11")
+	req.Header.Set("X-Apple-Privacy-Consent", "true")
+	req.Header.Set("X-Apple-Privacy-Consent-Accepted", "true")
 	if scnt := strings.TrimSpace(loginState.Scnt); scnt != "" {
 		req.Header.Set("scnt", scnt)
+	}
+	if sessionID := strings.TrimSpace(loginState.SessionID); sessionID != "" {
+		req.Header.Set("X-Apple-ID-Session-Id", sessionID)
+	}
+	if sessionToken := strings.TrimSpace(loginState.SessionToken); sessionToken != "" {
+		req.Header.Set("X-Apple-Session-Token", sessionToken)
+	}
+	if authAttributes := strings.TrimSpace(loginState.AuthAttributes); authAttributes != "" {
+		req.Header.Set("X-Apple-Auth-Attributes", authAttributes)
 	}
 	if apiKey = strings.TrimSpace(apiKey); apiKey != "" {
 		req.Header.Set("X-Apple-Api-Key", apiKey)
@@ -886,6 +951,9 @@ func updateAppleAccountLoginStateFromHeaders(loginState *LoginState, header http
 	}
 	if sessionID := strings.TrimSpace(header.Get("X-Apple-ID-Session-Id")); sessionID != "" {
 		loginState.SessionID = sessionID
+	}
+	if sessionToken := strings.TrimSpace(header.Get("X-Apple-Session-Token")); sessionToken != "" {
+		loginState.SessionToken = sessionToken
 	}
 	if token := strings.TrimSpace(firstNonEmpty(header.Get("X-Apple-I-DA-Token"), header.Get("X-Apple-I-Cont-X-Apple-I-DA-Token"))); token != "" {
 		loginState.DataAccessToken = token
@@ -2423,9 +2491,5 @@ func setICloudFetchHeaders(req *http.Request, session ICloudSession, accept, con
 }
 
 func iCloudOrigin(session ICloudSession) string {
-	host := strings.ToLower(session.Host)
-	if strings.Contains(host, "icloud.com.cn") {
-		return "https://www.icloud.com.cn"
-	}
 	return "https://www.icloud.com"
 }

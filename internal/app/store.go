@@ -27,6 +27,16 @@ type DeleteUserResult struct {
 	WebSessions    int    `json:"web_sessions"`
 }
 
+type DeleteICloudAccountResult struct {
+	AccountID      string `json:"account_id"`
+	OwnerID        string `json:"owner_id,omitempty"`
+	AppleID        string `json:"apple_id,omitempty"`
+	ICloudSessions int    `json:"icloud_sessions"`
+	Mailboxes      int    `json:"mailboxes"`
+	Messages       int    `json:"messages"`
+	CreateSettings int    `json:"create_settings"`
+}
+
 func NewFileStore(path string) (*FileStore, error) {
 	if path == "" {
 		path = filepath.Join("data", "state.json")
@@ -252,6 +262,97 @@ func (s *FileStore) DeleteUser(id string) (DeleteUserResult, error) {
 	s.state.WebSessions = webSessions
 
 	return result, s.saveLocked()
+}
+
+// DeleteICloudAccountForOwner removes one locally saved Apple account and all
+// data that is owned by that login. An empty ownerID is reserved for the
+// administrator/global scope; a non-empty ownerID must own the account.
+func (s *FileStore) DeleteICloudAccountForOwner(ownerID, accountID string) (DeleteICloudAccountResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ownerID = strings.TrimSpace(ownerID)
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return DeleteICloudAccountResult{}, errCode("account_not_found", "Apple 账号不存在", false)
+	}
+
+	accountIndex := -1
+	var account Account
+	for i, candidate := range s.state.Accounts {
+		if strings.TrimSpace(candidate.ID) == accountID {
+			accountIndex = i
+			account = candidate
+			break
+		}
+	}
+	if accountIndex < 0 {
+		return DeleteICloudAccountResult{}, errCode("account_not_found", "Apple 账号不存在", false)
+	}
+	if ownerID != "" && !sameOwnerID(ownerID, account.OwnerID) {
+		return DeleteICloudAccountResult{}, errCode("account_forbidden", "无权删除该 Apple 账号", false)
+	}
+
+	result := DeleteICloudAccountResult{
+		AccountID: account.ID,
+		OwnerID:   account.OwnerID,
+		AppleID:   strings.TrimSpace(account.AppleID),
+	}
+	s.state.Accounts = append(s.state.Accounts[:accountIndex], s.state.Accounts[accountIndex+1:]...)
+
+	deletedMailboxIDs := make(map[string]struct{})
+	mailboxes := s.state.Mailboxes[:0]
+	for _, mailbox := range s.state.Mailboxes {
+		if strings.TrimSpace(mailbox.AccountID) == accountID {
+			result.Mailboxes++
+			deletedMailboxIDs[mailbox.ID] = struct{}{}
+			continue
+		}
+		mailboxes = append(mailboxes, mailbox)
+	}
+	s.state.Mailboxes = mailboxes
+
+	messages := s.state.Messages[:0]
+	for _, message := range s.state.Messages {
+		if _, deleted := deletedMailboxIDs[message.MailboxID]; deleted {
+			result.Messages++
+			continue
+		}
+		messages = append(messages, message)
+	}
+	s.state.Messages = messages
+
+	sessions := s.state.ICloudSessions[:0]
+	for _, session := range s.state.ICloudSessions {
+		if iCloudSessionMatchesAccount(session, account) {
+			result.ICloudSessions++
+			continue
+		}
+		sessions = append(sessions, session)
+	}
+	s.state.ICloudSessions = sessions
+	if s.state.ICloudSession != nil && iCloudSessionMatchesAccount(*s.state.ICloudSession, account) {
+		result.ICloudSessions++
+		s.state.ICloudSession = nil
+	}
+
+	result.CreateSettings = s.removeAccountIDsFromCreateSettingsLocked(account.OwnerID, map[string]struct{}{accountID: {}})
+	return result, s.saveLocked()
+}
+
+func iCloudSessionMatchesAccount(session ICloudSession, account Account) bool {
+	if strings.TrimSpace(session.AccountID) != "" {
+		return strings.TrimSpace(session.AccountID) == strings.TrimSpace(account.ID)
+	}
+	if !sameOwnerID(session.OwnerID, account.OwnerID) {
+		return false
+	}
+	appleID := strings.TrimSpace(account.AppleID)
+	return appleID != "" && strings.EqualFold(strings.TrimSpace(session.AppleID), appleID)
+}
+
+func sameOwnerID(left, right string) bool {
+	return strings.TrimSpace(left) == strings.TrimSpace(right)
 }
 
 func (s *FileStore) CreateWebSession(userID string, isAdmin bool, ttl time.Duration) (string, WebSession, error) {
@@ -991,21 +1092,29 @@ func (s *FileStore) pruneDuplicateIMAPOnlySessionsLocked(ownerID string, target 
 	}
 }
 
-func (s *FileStore) removeAccountIDsFromCreateSettingsLocked(ownerID string, accountIDs map[string]struct{}) {
+func (s *FileStore) removeAccountIDsFromCreateSettingsLocked(ownerID string, accountIDs map[string]struct{}) int {
+	changed := 0
 	for i, settings := range s.state.CreateSettings {
-		if !constantTimeEqual(ownerID, settings.OwnerID) {
+		if !sameOwnerID(ownerID, settings.OwnerID) {
 			continue
 		}
+		removed := false
 		next := settings.AccountIDs[:0]
 		for _, accountID := range settings.AccountIDs {
 			if _, remove := accountIDs[strings.TrimSpace(accountID)]; remove {
+				removed = true
 				continue
 			}
 			next = append(next, accountID)
 		}
+		if !removed {
+			continue
+		}
 		s.state.CreateSettings[i].AccountIDs = normalizeAccountIDSelection("", next)
 		s.state.CreateSettings[i].UpdatedAt = time.Now()
+		changed++
 	}
+	return changed
 }
 
 func (s *FileStore) pruneRemovedIMAPOnlyAccountsLocked(ownerID string, accountIDs map[string]struct{}) {
@@ -1161,13 +1270,23 @@ func cloneICloudSession(in ICloudSession) ICloudSession {
 	out := in
 	out.Cookies = append([]SessionCookie(nil), in.Cookies...)
 	out.LoginStates = cloneLoginStates(in.LoginStates)
+	out.AppleLogin = cloneAppleLoginCredentials(in.AppleLogin)
 	return out
+}
+
+func cloneAppleLoginCredentials(in *AppleLoginCredentials) *AppleLoginCredentials {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	return &out
 }
 
 func mergeICloudSession(existing, incoming ICloudSession) ICloudSession {
 	out := incoming
 	out.OwnerID = firstNonEmpty(incoming.OwnerID, existing.OwnerID)
 	out.AccountID = firstNonEmpty(incoming.AccountID, existing.AccountID)
+	out.ProxyID = firstNonEmpty(incoming.ProxyID, existing.ProxyID)
 	if out.SavedAt.IsZero() {
 		out.SavedAt = existing.SavedAt
 	}
@@ -1182,6 +1301,11 @@ func mergeICloudSession(existing, incoming ICloudSession) ICloudSession {
 	out.Host = firstNonEmpty(incoming.Host, existing.Host)
 	out.IsICloudPlus = incoming.IsICloudPlus || existing.IsICloudPlus
 	out.CanCreateHME = incoming.CanCreateHME || existing.CanCreateHME
+	if incoming.AppleLogin != nil {
+		out.AppleLogin = cloneAppleLoginCredentials(incoming.AppleLogin)
+	} else {
+		out.AppleLogin = cloneAppleLoginCredentials(existing.AppleLogin)
+	}
 	if len(out.Cookies) == 0 {
 		out.Cookies = append([]SessionCookie(nil), existing.Cookies...)
 	}
@@ -1204,6 +1328,7 @@ func mergeLoginStates(existing, incoming []LoginState) []LoginState {
 		for i, current := range out {
 			if current.Kind == state.Kind {
 				next := state
+				next.ProxyID = firstNonEmpty(state.ProxyID, current.ProxyID)
 				next.Cookies = append([]SessionCookie(nil), state.Cookies...)
 				out[i] = next
 				replaced = true

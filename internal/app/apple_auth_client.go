@@ -43,6 +43,15 @@ func normalizeAppleTwoFactorMethod(method string) string {
 
 type AppleAuthClient struct {
 	httpClient *http.Client
+	proxyID    string
+}
+
+type appleAuthLoginClient interface {
+	HTTPClient() *http.Client
+	StartLogin(context.Context, string, string, string, string, *appleAuthPendingStore, string) (appleAuthStartResult, error)
+	StartAppleAccountManageLogin(context.Context, string, string, *appleAuthPendingStore, string) (appleAuthStartResult, error)
+	Submit2FA(context.Context, appleAuthPending, string) (ICloudSession, error)
+	SubmitAppleAccountManage2FA(context.Context, appleAuthPending, string, json.RawMessage) (ICloudSession, error)
 }
 
 type appleAuthEndpoints struct {
@@ -72,6 +81,7 @@ type appleAuthSession struct {
 	TwoFactorPhone      json.RawMessage
 	TwoFactorMethod     string
 	Cookies             []SessionCookie
+	ProxyID             string
 }
 
 type appleSRPInitResponse struct {
@@ -121,10 +131,11 @@ type appleAccountInfo struct {
 }
 
 type appleAuthPending struct {
-	ID        string
-	Session   *appleAuthSession
-	CreatedAt time.Time
-	ExpiresAt time.Time
+	ID          string
+	Session     *appleAuthSession
+	Credentials *AppleLoginCredentials
+	CreatedAt   time.Time
+	ExpiresAt   time.Time
 }
 
 type appleAuthPendingStore struct {
@@ -136,21 +147,47 @@ func NewAppleAuthClient() *AppleAuthClient {
 	return &AppleAuthClient{httpClient: &http.Client{Timeout: 30 * time.Second}}
 }
 
+func NewAppleAuthClientWithHTTPClient(client *http.Client) *AppleAuthClient {
+	if client == nil {
+		return NewAppleAuthClient()
+	}
+	return &AppleAuthClient{httpClient: client}
+}
+
+func NewAppleAuthClientWithProxy(client *http.Client, proxyID string) *AppleAuthClient {
+	if client == nil {
+		return NewAppleAuthClient()
+	}
+	return &AppleAuthClient{httpClient: client, proxyID: strings.TrimSpace(proxyID)}
+}
+
+func (c *AppleAuthClient) HTTPClient() *http.Client {
+	if c == nil {
+		return nil
+	}
+	return c.httpClient
+}
+
 func newAppleAuthPendingStore() *appleAuthPendingStore {
 	return &appleAuthPendingStore{items: make(map[string]appleAuthPending)}
 }
 
 func (s *appleAuthPendingStore) put(session *appleAuthSession) (appleAuthPending, error) {
+	return s.putWithCredentials(session, nil)
+}
+
+func (s *appleAuthPendingStore) putWithCredentials(session *appleAuthSession, credentials *AppleLoginCredentials) (appleAuthPending, error) {
 	id, err := randomToken(18)
 	if err != nil {
 		return appleAuthPending{}, err
 	}
 	now := time.Now()
 	pending := appleAuthPending{
-		ID:        id,
-		Session:   session,
-		CreatedAt: now,
-		ExpiresAt: now.Add(10 * time.Minute),
+		ID:          id,
+		Session:     session,
+		Credentials: cloneAppleLoginCredentials(credentials),
+		CreatedAt:   now,
+		ExpiresAt:   now.Add(10 * time.Minute),
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -165,7 +202,25 @@ func (s *appleAuthPendingStore) get(id string) (appleAuthPending, bool) {
 	defer s.mu.Unlock()
 	s.cleanupLocked(now)
 	pending, ok := s.items[strings.TrimSpace(id)]
+	if ok {
+		pending.Credentials = cloneAppleLoginCredentials(pending.Credentials)
+	}
 	return pending, ok
+}
+
+func (s *appleAuthPendingStore) setCredentials(id string, credentials *AppleLoginCredentials) bool {
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanupLocked(now)
+	id = strings.TrimSpace(id)
+	pending, ok := s.items[id]
+	if !ok {
+		return false
+	}
+	pending.Credentials = cloneAppleLoginCredentials(credentials)
+	s.items[id] = pending
+	return true
 }
 
 func (s *appleAuthPendingStore) delete(id string) {
@@ -220,6 +275,7 @@ func (c *AppleAuthClient) StartAppleAccountManageLogin(ctx context.Context, appl
 		ClientID:  appleAccountManageOAuthClientID,
 		FrameID:   strings.ToLower(frameID),
 		UserAgent: appleAccountManageUserAgent,
+		ProxyID:   c.proxyID,
 	}
 	if err := c.primeAppleAccountManageState(ctx, session); err != nil {
 		return appleAuthStartResult{}, err
@@ -283,6 +339,7 @@ func (c *AppleAuthClient) startLoginOnHost(ctx context.Context, appleID, passwor
 		AppleID:   appleID,
 		ClientID:  firstNonEmpty(clientID, defaultAppleOAuthClientID),
 		FrameID:   strings.ToLower(frameID),
+		ProxyID:   c.proxyID,
 	}
 	if err := c.authStart(ctx, session); err != nil {
 		return appleAuthStartResult{}, err
@@ -296,9 +353,6 @@ func (c *AppleAuthClient) startLoginOnHost(ctx context.Context, appleID, passwor
 	}
 	if redirect, ok := session.redirectForAccountCountry(); ok {
 		return appleAuthStartResult{}, redirect
-	}
-	if session.SessionToken == "" {
-		return appleAuthStartResult{}, errCode("apple_session_token_missing", "Apple 登录未返回 Session Token，请重新协议登录或检查账号安全状态", true)
 	}
 	if needs2FA {
 		session.TwoFactorMethod = normalizeAppleTwoFactorMethod(twoFactorMethod)
@@ -327,6 +381,9 @@ func (c *AppleAuthClient) startLoginOnHost(ctx context.Context, appleID, passwor
 			AppleID:   strings.TrimSpace(appleID),
 			ExpiresAt: pending.ExpiresAt,
 		}, nil
+	}
+	if session.SessionToken == "" {
+		return appleAuthStartResult{}, errCode("apple_session_token_missing", "Apple 登录未返回 Session Token，请重新协议登录或检查账号安全状态", true)
 	}
 
 	icloudSession, err := c.authWithTokenAndValidate(ctx, session)
@@ -413,16 +470,7 @@ func (c *AppleAuthClient) submit2FAWithSession(ctx context.Context, session *app
 	return c.authWithTokenAndValidate(ctx, session)
 }
 
-func appleAuthEndpointsForHost(host string) appleAuthEndpoints {
-	host = strings.ToLower(strings.TrimSpace(host))
-	if strings.Contains(host, "icloud.com.cn") {
-		return appleAuthEndpoints{
-			Home:  "https://www.icloud.com.cn",
-			Setup: "https://setup.icloud.com.cn/setup/ws/1",
-			Auth:  "https://idmsa.apple.com.cn/appleauth/auth",
-			Host:  "www.icloud.com.cn",
-		}
-	}
+func appleAuthEndpointsForHost(_ string) appleAuthEndpoints {
 	return appleAuthEndpoints{
 		Home:  "https://www.icloud.com",
 		Setup: "https://setup.icloud.com/setup/ws/1",
@@ -445,9 +493,6 @@ func appleDomainToHost(domain string) string {
 	domain = strings.TrimPrefix(domain, "http://")
 	domain = strings.TrimPrefix(domain, "www.")
 	domain = strings.TrimSuffix(domain, "/")
-	if strings.Contains(domain, "icloud.com.cn") {
-		return "www.icloud.com.cn"
-	}
 	if strings.Contains(domain, "icloud.com") {
 		return "www.icloud.com"
 	}
@@ -458,9 +503,6 @@ func appleHostForAccountCountry(country string) string {
 	country = strings.ToUpper(strings.TrimSpace(country))
 	if country == "" {
 		return ""
-	}
-	if country == "CHN" || country == "CN" {
-		return "www.icloud.com.cn"
 	}
 	return "www.icloud.com"
 }
@@ -507,7 +549,7 @@ func (c *AppleAuthClient) authStart(ctx context.Context, session *appleAuthSessi
 		headers["Sec-Fetch-Mode"] = "navigate"
 		headers["Sec-Fetch-Site"] = "same-site"
 	} else {
-		q.Set("language", "zh_CN")
+		q.Set("language", "en-US")
 		q.Set("authVersion", "latest")
 	}
 	u.RawQuery = q.Encode()
@@ -592,11 +634,18 @@ func (c *AppleAuthClient) authSRP(ctx context.Context, session *appleAuthSession
 		}
 		headers["X-Apple-HC"] = hc
 	}
-	status, _, err := c.do(ctx, session, http.MethodPost, session.Endpoints.Auth+"/signin/complete?isRememberMeEnabled=true", headers, completeBody, nil, true)
+	status, data, err := c.do(ctx, session, http.MethodPost, session.Endpoints.Auth+"/signin/complete?isRememberMeEnabled=true", headers, completeBody, nil, true)
 	if status == http.StatusUnauthorized {
 		return false, errCode("apple_credentials_invalid", "Apple ID 或密码错误，请检查后重新协议登录", false)
 	}
-	return status == http.StatusConflict, err
+	if status == http.StatusConflict || status == http.StatusLocked {
+		// Apple uses both 409 and 423 for the same post-password 2FA
+		// challenge. The 423 response contains the trusted phone metadata
+		// needed by the SMS verification endpoint.
+		session.rememberTwoFactorPhoneNumber(data)
+		return true, nil
+	}
+	return false, err
 }
 
 func generateAppleHashcash(bits int, challenge string, now time.Time) (string, error) {
@@ -669,30 +718,10 @@ func (c *AppleAuthClient) primeAppleAccountManageState(ctx context.Context, sess
 	if session == nil || !session.isAppleAccountManage() {
 		return nil
 	}
-	state := LoginState{
-		Kind:      LoginStateAppleAccount,
-		Host:      "appleid.apple.com",
-		Origin:    appleAccountManageOrigin,
-		UserAgent: firstNonEmpty(session.UserAgent, appleAccountManageUserAgent),
-	}
-	client := &ICloudClient{client: c.httpClient}
-	if err := client.warmAppleAccountPortal(ctx, &state); err != nil {
-		return err
-	}
-	var token struct {
-		TimeOutInterval int `json:"timeOutInterval"`
-	}
-	tokenState := state
-	tokenState.Scnt = ""
-	scnt, err := client.fetchAppleAccountManageTokenScnt(ctx, tokenState, &token)
-	if err != nil {
-		if strings.TrimSpace(scnt) == "" {
-			return err
-		}
-	}
-	if scnt := strings.TrimSpace(scnt); scnt != "" {
-		session.ManageScnt = scnt
-	}
+	// Apple rejects anonymous requests to the management portal with 403 or
+	// 502. The authorization endpoints establish the real session and provide
+	// the management scnt after authentication, so an anonymous portal warm-up
+	// must not block login.
 	return nil
 }
 
@@ -851,15 +880,27 @@ func (c *AppleAuthClient) trustSession(ctx context.Context, session *appleAuthSe
 func (c *AppleAuthClient) authWithAppleAccountManage(ctx context.Context, session *appleAuthSession) (ICloudSession, error) {
 	now := time.Now()
 	loginState := LoginState{
-		Kind:      LoginStateAppleAccount,
-		Host:      "appleid.apple.com",
-		Origin:    appleAccountManageOrigin,
-		SavedAt:   now,
-		Cookies:   session.cloneCookies(),
-		Scnt:      firstNonEmpty(session.Scnt, session.ManageScnt),
-		SessionID: session.SessionID,
-		UserAgent: appleAccountManageUserAgent,
-		Note:      "Apple Account management login state",
+		Kind:           LoginStateAppleAccount,
+		Host:           "appleid.apple.com",
+		Origin:         appleAccountManageOrigin,
+		SavedAt:        now,
+		Cookies:        session.cloneCookies(),
+		Scnt:           firstNonEmpty(session.Scnt, session.ManageScnt),
+		SessionID:      session.SessionID,
+		SessionToken:   session.SessionToken,
+		AuthAttributes: session.AuthAttributes,
+		ProxyID:        session.ProxyID,
+		UserAgent:      appleAccountManageUserAgent,
+		Note:           "Apple Account management login state",
+	}
+	if os.Getenv("IPM_DEBUG_APPLE_ACCOUNT") == "1" {
+		fmt.Fprintf(os.Stderr, "APPLE_ACCOUNT_AUTH_STATE scnt=%s session=%s token=%s auth_attributes=%s cookie_count=%d\n",
+			appleDebugFingerprint(loginState.Scnt),
+			appleDebugFingerprint(loginState.SessionID),
+			appleDebugFingerprint(loginState.SessionToken),
+			appleDebugFingerprint(loginState.AuthAttributes),
+			len(loginState.Cookies),
+		)
 	}
 	refreshed, err := (&ICloudClient{client: c.httpClient}).RefreshAppleAccountManageState(ctx, loginState)
 	if err != nil {
@@ -893,7 +934,9 @@ func (c *AppleAuthClient) authWithTokenAndValidate(ctx context.Context, session 
 		return ICloudSession{}, err
 	}
 	cookies := session.cloneCookies()
-	validate, err := NewICloudSessionValidator().Validate(ctx, cookies, session.Endpoints.Host)
+	validator := NewICloudSessionValidator()
+	validator.httpClient = c.httpClient
+	validate, err := validator.Validate(ctx, cookies, session.Endpoints.Host)
 	if err != nil {
 		return ICloudSession{}, err
 	}
@@ -920,6 +963,7 @@ func (c *AppleAuthClient) authWithTokenAndValidate(ctx context.Context, session 
 				SavedAt:   savedAt,
 				Cookies:   append([]SessionCookie(nil), cookies...),
 				UserAgent: appleAuthUserAgent,
+				ProxyID:   session.ProxyID,
 				Note:      "iCloud webservices login state",
 			},
 		},
@@ -985,7 +1029,7 @@ func (c *AppleAuthClient) do(ctx context.Context, session *appleAuthSession, met
 	if resp.StatusCode == http.StatusForbidden {
 		return resp.StatusCode, nil, errCode("apple_login_forbidden", "Apple ID 或密码错误，或当前账号被限制登录", true)
 	}
-	if allow409 && resp.StatusCode == http.StatusConflict {
+	if allow409 && (resp.StatusCode == http.StatusConflict || resp.StatusCode == http.StatusLocked) {
 		return resp.StatusCode, data, nil
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -1138,11 +1182,7 @@ func (s *appleAuthSession) redirectForAccountCountry() (appleDomainRedirectError
 	if next.Host == "" || next.Host == s.Endpoints.Host {
 		return appleDomainRedirectError{}, false
 	}
-	domain := "iCloud.com"
-	if strings.Contains(next.Host, "icloud.com.cn") {
-		domain = "iCloud.com.cn"
-	}
-	return appleDomainRedirectError{DomainToUse: domain, Host: next.Host}, true
+	return appleDomainRedirectError{DomainToUse: "iCloud.com", Host: next.Host}, true
 }
 
 func (s *appleAuthSession) mergeCookies(requestURL *url.URL, cookies []*http.Cookie) {
@@ -1174,7 +1214,7 @@ func (s *appleAuthSession) srpHeaders() map[string]string {
 		"X-Requested-With":                 "XMLHttpRequest",
 		"X-Apple-Mandate-Security-Upgrade": "0",
 		"X-Apple-I-Require-UE":             "true",
-		"X-Apple-I-FD-Client-Info":         `{"U":"` + userAgent + `","L":"zh-CN","Z":"GMT+08:00","V":"1.1","F":""}`,
+		"X-Apple-I-FD-Client-Info":         `{"U":"` + userAgent + `","L":"en-US","Z":"GMT-05:00","V":"1.1","F":""}`,
 	}
 	if s.isAppleAccountManage() {
 		headers["Accept"] = "application/json, text/javascript, */*; q=0.01"

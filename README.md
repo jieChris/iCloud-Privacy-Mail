@@ -70,7 +70,7 @@ Copy-Item .\config.example.json .\config.json
 | `data_path` | 服务器状态文件，默认 `data/state.json` |
 | `api_key` | 全局 API Key，用于健康检查和自动取号；管理面板不使用它登录 |
 | `public_base_url` | 对外复制 API 地址用的公网地址，例如 `https://www.example.com` |
-| `icloud_default_host` | iCloud 登录态校验 Host，默认 `www.icloud.com.cn` |
+| `icloud_default_host` | iCloud 登录态校验 Host，默认 `www.icloud.com` |
 | `icloud_client_id` | iCloud Web 公共 Client ID，通常不用修改 |
 | `update_enabled` | 是否启用面板“检测更新/在线更新”，默认 `true` |
 | `update_repository` | 未配置 manifest 时读取的 GitHub 仓库，默认 `q1953258942/iCloud-Privacy-Mail` |
@@ -86,7 +86,7 @@ Copy-Item .\config.example.json .\config.json
   "data_path": "/opt/icloud-privacy-mail/shared/data/state.json",
   "api_key": "CHANGE_ME_GLOBAL_API_KEY",
   "public_base_url": "https://www.example.com",
-  "icloud_default_host": "www.icloud.com.cn",
+  "icloud_default_host": "www.icloud.com",
   "icloud_client_id": "d39ba9916b7251055b22c7f910e2ea796ee65e98b2ddecea8f5dde8d9d1a815d",
   "update_enabled": true,
   "update_repository": "q1953258942/iCloud-Privacy-Mail",
@@ -166,7 +166,7 @@ http://127.0.0.1:8787/login
 5. 点击 `提交旧接口验证码`。
 6. 后端会完成 `2sv/trust`、`accountLogin` 和 `setup/ws/1/validate`，并把 iCloud Cookie 写入服务器 `data_path`。
 
-密码只参与当前登录请求，不写入状态文件、不返回前端、不写日志。
+密码不会返回前端或写入日志；为支持登录态失效后的自动恢复，成功登录后会与 Apple ID 一起写入 `data_path`，但不会出现在公开 session 或运行数据导出中。
 
 同一平台账号可以保存多个 Apple 登录态。保存成功后会生成一个内部 `account_id`，后续创建、同步、导出都会用这个 `account_id` 绑定数据；前端会用 TAB 展示不同 Apple 账号，避免多个账号的邮箱混在一起。
 
@@ -189,7 +189,31 @@ http://127.0.0.1:8787/login
 
 新接口的 `account/manage` 管理态和浏览器里的 “Remember me” 不等同于旧 iCloud Web 的长效 Cookie。Apple Account 管理接口返回的是短期活动窗口，后端会按 Apple 返回的 TTL 到期时间刷新 `scnt`、Cookie 和 `apiKey`；刷新成功后才写回状态文件，非 2xx 失败响应不会覆盖已保存的 `scnt` 或 Cookie。旧接口之所以更长效，是因为它额外完成 `2sv/trust`、`accountLogin` 的 `extended_login` 交换，并保存 iCloud WebServices Cookie。
 
+### 2.1 短信链接自动验证码与自动恢复
+
+登录时可在“手机号 | 短信链接”输入框填写手机号和短信接口地址，格式为：
+
+```text
++19858008317|http://a.62-us.com/api/get_sms?key=YOUR_KEY
+```
+
+也兼容旧格式 `手机号----短信链接`。当 Apple 登录进入 2FA 阶段且验证码输入框为空时，后端会轮询该链接最多 90 秒，识别纯文本或 JSON 中的 6 位验证码并自动提交；也可以继续手动输入验证码。短信接口地址应只返回当前登录流程的验证码。
+
+完成一次登录后，Apple ID、密码、手机号、短信链接和 2FA 方式会写入 `data_path`，用于登录态失效后的自动恢复。手动检测登录态、Apple Account 保活，以及创建隐私邮箱遇到认证失效时，服务会自动重新登录；如果 Apple 再次要求 2FA，会从短信链接取码后继续完成恢复。未配置短信链接或链接失效时，仍可手动输入验证码。
+
 排障时可使用 `IPM_DEBUG_APPLE_ACCOUNT=1` 查看脱敏后的请求摘要。日志只输出 method/path、状态码、Cookie 长度和响应头指纹；响应体中的 API key、token、session、账号和邮箱字段会被脱敏，不输出完整 Cookie、`scnt`、密码或验证码。
+
+### 2.2 管理页面维护代理池
+
+管理员登录 `/manage` 后，打开左侧“代理池”入口即可维护 Apple 流量使用的 SOCKS5 节点。页面支持启用/停用代理池、添加或删除节点、修改轮询和故障隔离参数，以及测试单个节点连通性。
+
+新增节点时填写唯一的代理 ID 和地址，例如：
+
+```text
+socks5h://USERNAME:PASSWORD@proxy.example.com:9000
+```
+
+用户名或密码包含 `@`、`:`、`/` 等 URL 保留字符时，需要先进行 URL 编码。节点凭据只写入服务器的 `config.json`，管理接口和页面仅返回脱敏地址。保存后配置即时生效，不需要手动编辑 JSON 或重启服务；已有 Apple 账号继续使用已绑定的代理 ID，新增账号按轮询分配可用节点。
 
 ### 3. 创建隐私邮箱
 

@@ -13,6 +13,7 @@ dist/
 data/
 logs/
 captures/
+deploy-backups/
 苹果登录JS分析/
 .anna_manifest_tmp.json
 .anna_skills/

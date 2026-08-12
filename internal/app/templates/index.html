@@ -1196,6 +1196,7 @@
           <div class="field-grid">
             <label>Apple ID<input id="protocolAppleId" autocomplete="username" placeholder="name@icloud.com"></label>
             <label>密码<input id="protocolPassword" type="password" autocomplete="current-password" placeholder="Apple ID 密码"></label>
+            <label class="full">手机号 | 短信链接<input id="appleSMSLink" autocomplete="off" placeholder="+19858008317|http://a.62-us.com/api/get_sms?key=..."></label>
             <label class="full">2FA 验证码<input id="protocol2FA" inputmode="numeric" maxlength="6" placeholder="收到后输入 6 位验证码"></label>
             <label>新接口验证码方式
               <select id="appleAccount2FAMethod">
@@ -1211,15 +1212,15 @@
             </label>
           </div>
           <div class="toolbar">
-            <button class="primary" onclick="startAppleAccountLogin()">新接口登录</button>
+            <button id="appleAccountLoginButton" class="primary" onclick="startAppleAccountLogin()">新接口登录</button>
             <button id="appleAccount2FAButton" onclick="submitAppleAccount2FA()">提交新接口验证码</button>
-            <button onclick="startProtocolLogin()">旧接口登录</button>
+            <button id="protocolLoginButton" onclick="startProtocolLogin()">旧接口登录</button>
             <button id="protocol2FAButton" onclick="submitProtocol2FA()">提交旧接口验证码</button>
             <button type="button" onclick="saveCreateSettings()">保存配置</button>
             <button id="sessionCheckButton" onclick="checkICloudSession()">检测登录态</button>
             <span id="loginSettingsStatus" class="muted"></span>
           </div>
-          <div class="hint">新接口每小时约可创建 20 个，旧接口每小时约可创建 5 个；两种登录态都保存后可一起创建，合计约 25 个/小时。</div>
+          <div class="hint">填写手机号短信链接后，登录等待 2FA 时会自动轮询取码并提交；账号密码和短信链接会保存在本地，用于登录态失效后的自动重登录。</div>
           <div class="field-grid">
             <label>iCloud 邮箱账号<input id="imapEmail" autocomplete="username" placeholder="name@icloud.com"></label>
             <label>App 专用密码<input id="imapAppPassword" type="password" autocomplete="new-password" placeholder="xxxx-xxxx-xxxx-xxxx"></label>
@@ -1395,6 +1396,8 @@
     let activeICloudSessionKey = '';
     let protocolPendingID = '';
     let appleAccountPendingID = '';
+    let protocolSMSPollToken = 0;
+    let appleAccountSMSPollToken = 0;
     let sessionCheckTimer = null;
     let sessionCheckInFlight = false;
     let schedulerPollTimer = null;
@@ -2692,13 +2695,17 @@
       const imapInfo = active.icloud_imap_login_saved
         ? `<br>取码邮箱：${esc(active.icloud_imap_email || active.apple_id || '-')} ${active.icloud_imap_host ? `<span class="muted">/ ${esc(active.icloud_imap_host)}</span>` : ''}`
         : '';
+      const recoveryInfo = active.apple_login_recovery_configured
+        ? '<br>自动重登录：已配置短信链接'
+        : '<br>自动重登录：未配置短信链接';
       $('icloudSessionInfo').innerHTML =
         `<div>已保存 ${displaySessions.length} 个 Apple 登录态，Apple 登录态只用于创建邮箱；取码走取码登录。</div>` +
         `<div class="session-tabs">${tabs}</div>` +
         `<div class="session-card"><div class="session-card-line"><span>Apple ID：${esc(active.apple_id || '-')}</span>${sessionManageRefreshBadge(active)}</div>` +
-        `账号ID：${esc(active.account_id || '-')}${imapInfo}<br>` +
+        `账号ID：${esc(active.account_id || '-')}${imapInfo}${recoveryInfo}<br>` +
         `<div class="login-chips">${sessionLoginBadges(active)}</div>` +
-        `${esc(overallLoginStateText(active))}</div>`;
+        `${esc(overallLoginStateText(active))}` +
+        `${active.account_id ? `<div class="row-actions" style="margin-top:10px"><button class="danger" type="button" onclick="deleteICloudAccount('${esc(active.account_id)}')">删除本地 Apple 账号</button></div>` : ''}</div>`;
       renderCreateAccountSelector();
       updateManageRefreshClocks();
     }
@@ -2710,6 +2717,22 @@
     function setICloudSessionTab(key) {
       activeICloudSessionKey = key || '';
       renderICloudSessions(lastICloudSessions);
+    }
+
+    async function deleteICloudAccount(accountID) {
+      if (!accountID) return;
+      const session = (lastICloudSessions || []).find(item => item && item.account_id === accountID) || {};
+      const name = session.apple_id || accountID;
+      if (!confirm(`确定删除 Apple 账号「${name}」吗？只删除本地保存的数据，不会删除 Apple 远端账号；登录态、自动重登录凭据、关联隐私邮箱和验证码邮件会一并清理。`)) return;
+      try {
+        const data = await api('/api/accounts/' + encodeURIComponent(accountID), {method:'DELETE'});
+        if (activeICloudSessionKey === accountID) activeICloudSessionKey = '';
+        log(`已删除 Apple 账号：${name}；清理登录态 ${(data.deleted && data.deleted.icloud_sessions) || 0} 个`);
+        await refresh();
+      } catch (err) {
+        log('删除 Apple 账号失败：' + err.message);
+        if ($('icloudSessionInfo')) $('icloudSessionInfo').textContent = '删除 Apple 账号失败：' + err.message;
+      }
     }
 
     function activeICloudSessionForBinding() {
@@ -2803,37 +2826,159 @@
       }
     }
 
-    async function startProtocolLogin() {
-      const appleId = $('protocolAppleId').value.trim();
-      const data = await api('/api/icloud/protocol-login/start', {method:'POST', body: JSON.stringify({
-        apple_id: appleId,
-        password: $('protocolPassword').value,
-        two_factor_method: twoFactorMethodPayloadValue('iCloudWeb2FAMethod')
-      })});
-      $('protocolPassword').value = '';
-      if (data.needs_2fa) {
-        protocolPendingID = data.pending_id || '';
-        log(`${data.message || '需要 2FA'}：${data.apple_id || appleId}，有效期 ${data.expires_at || '-'}`);
-        $('icloudSessionInfo').textContent = `${data.message || '需要 2FA'}\n账号：${data.apple_id || appleId}\n有效期：${data.expires_at || '-'}`;
-        return;
-      }
-      renderICloudSession(data.session);
-      if (data.sessions) renderICloudSessions(data.sessions);
-      log('旧接口登录态已保存：' + (data.session.apple_id || appleId));
-      await refresh();
+    function setLoginStartBusy(buttonID, busy) {
+      const buttons = ['appleAccountLoginButton', 'protocolLoginButton'].map(id => $(id)).filter(Boolean);
+      buttons.forEach(button => {
+        if (busy) {
+          button.disabled = true;
+          if (button.id === buttonID) {
+            button.dataset.originalText = button.textContent;
+            button.textContent = '登录中...';
+          }
+          return;
+        }
+        button.disabled = false;
+        if (button.id === buttonID && button.dataset.originalText) {
+          button.textContent = button.dataset.originalText;
+          delete button.dataset.originalText;
+        }
+      });
     }
 
-    async function submitProtocol2FA() {
+    function stopSMSCodePolling(kind) {
+      if (kind === 'apple_account') {
+        appleAccountSMSPollToken++;
+      } else {
+        protocolSMSPollToken++;
+      }
+    }
+
+    async function requestPendingSMSCode(kind, pendingID) {
+      const path = kind === 'apple_account'
+        ? '/api/apple-account/login/2fa/code'
+        : '/api/icloud/protocol-login/2fa/code';
+      const res = await fetch(path, {
+        method: 'POST',
+        headers: {'content-type': 'application/json'},
+        credentials: 'same-origin',
+        body: JSON.stringify({pending_id: pendingID})
+      });
+      let data;
+      try {
+        data = await res.json();
+      } catch (err) {
+        throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+      }
+      if (res.status === 401) {
+        location.href = '/login';
+        throw new Error('请先登录');
+      }
+      if (!res.ok || (!data.success && !data.pending)) {
+        const err = new Error(data.message || data.code || `HTTP ${res.status}`);
+        err.code = data.code || '';
+        throw err;
+      }
+      return data;
+    }
+
+    async function autoFillSMSCode(kind, pendingID) {
+      const token = kind === 'apple_account' ? ++appleAccountSMSPollToken : ++protocolSMSPollToken;
+      const deadline = Date.now() + 90000;
+      let submittedAttempts = 0;
+      while (Date.now() < deadline) {
+        const currentToken = kind === 'apple_account' ? appleAccountSMSPollToken : protocolSMSPollToken;
+        const currentPending = kind === 'apple_account' ? appleAccountPendingID : protocolPendingID;
+        if (token !== currentToken || currentPending !== pendingID) return;
+        try {
+          const data = await requestPendingSMSCode(kind, pendingID);
+          if (data.success && /^\d{6}$/.test(String(data.code || ''))) {
+            const input = $('protocol2FA');
+            input.value = String(data.code);
+            log('已从短信链接获取 2FA 验证码，正在自动提交');
+            const result = kind === 'apple_account'
+              ? await submitAppleAccount2FA(true)
+              : await submitProtocol2FA(true);
+            if (result && result.success) {
+              return;
+            }
+            if (!result || !result.retryable) {
+              return;
+            }
+            submittedAttempts++;
+            if (submittedAttempts >= 3) {
+              $('icloudSessionInfo').textContent = '短信验证码连续 3 次验证失败，请重新发起登录或手动检查短信接口。';
+              log('短信验证码连续 3 次验证失败，已停止自动重试');
+              return;
+            }
+            input.value = '';
+            log(`第 ${submittedAttempts} 次短信验证码验证失败，5 秒后重新取码`);
+            await new Promise(resolve => setTimeout(resolve, 5000));
+            continue;
+          }
+        } catch (err) {
+          log('短信验证码读取失败：' + err.message);
+          return;
+        }
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
+      const currentPending = kind === 'apple_account' ? appleAccountPendingID : protocolPendingID;
+      if (currentPending === pendingID) {
+        $('icloudSessionInfo').textContent = '短信验证码等待超时，请检查短信链接或手动输入验证码。';
+        log('短信验证码等待超时，请检查短信链接或手动输入验证码');
+      }
+    }
+
+    async function startProtocolLogin() {
+      const appleId = $('protocolAppleId').value.trim();
+      const password = $('protocolPassword').value;
+      if (!appleId || !password) {
+        $('icloudSessionInfo').textContent = '请输入 Apple ID 和密码后再开始旧接口登录。';
+        log('旧接口登录未开始：请输入 Apple ID 和密码');
+        return;
+      }
+      setLoginStartBusy('protocolLoginButton', true);
+      $('icloudSessionInfo').textContent = '正在连接 Apple 并验证账号密码，请等待...';
+      log('开始旧接口登录：正在连接 Apple');
+      try {
+        const data = await api('/api/icloud/protocol-login/start', {method:'POST', body: JSON.stringify({
+          apple_id: appleId,
+          password,
+          sms_link: $('appleSMSLink').value.trim(),
+          two_factor_method: twoFactorMethodPayloadValue('iCloudWeb2FAMethod')
+        })});
+        if (data.needs_2fa) {
+          protocolPendingID = data.pending_id || '';
+          log(`${data.message || '需要 2FA'}：${data.apple_id || appleId}，有效期 ${data.expires_at || '-'}`);
+          $('icloudSessionInfo').textContent = `${data.message || '需要 2FA'}\n账号：${data.apple_id || appleId}\n有效期：${data.expires_at || '-'}`;
+          void autoFillSMSCode('icloud_web', protocolPendingID);
+          return;
+        }
+        renderICloudSession(data.session);
+        if (data.sessions) renderICloudSessions(data.sessions);
+        $('icloudSessionInfo').textContent = data.message || '旧接口登录成功，登录态已保存。';
+        log('旧接口登录态已保存：' + (data.session.apple_id || appleId));
+        await refresh();
+      } catch (err) {
+        const message = err && err.message ? err.message : '请求失败';
+        $('icloudSessionInfo').textContent = '旧接口登录失败：' + message;
+        log('旧接口登录失败：' + message);
+      } finally {
+        setLoginStartBusy('protocolLoginButton', false);
+      }
+    }
+
+    async function submitProtocol2FA(fromAuto = false) {
+      if (!fromAuto) stopSMSCodePolling('icloud_web');
       if (!protocolPendingID) {
         log('没有待验证的旧接口登录，请先点击“旧接口登录”');
         $('icloudSessionInfo').textContent = '没有待验证的旧接口登录，请先点击“旧接口登录”。';
-        return;
+        return {success: false, retryable: false};
       }
       const code = $('protocol2FA').value.trim();
-      if (!/^\d{6}$/.test(code)) {
+      if (code && !/^\d{6}$/.test(code)) {
         log('旧接口验证码提交失败：请输入 6 位验证码');
         $('icloudSessionInfo').textContent = '旧接口验证码提交失败：请输入 6 位验证码。';
-        return;
+        return {success: false, retryable: false};
       }
       const button = $('protocol2FAButton');
       const pendingID = protocolPendingID;
@@ -2851,45 +2996,77 @@
         if (data.sessions) renderICloudSessions(data.sessions);
         log((data.message || '旧接口登录态已保存') + '：' + (data.session.apple_id || '-'));
         await refresh();
+        return {success: true, retryable: false};
       } catch (err) {
         log('旧接口验证码提交失败：' + err.message);
         $('icloudSessionInfo').textContent = '旧接口验证码提交失败：' + err.message;
+        return {
+          success: false,
+          retryable: err && (err.code === 'apple_2fa_failed' || err.code === 'invalid_2fa_code')
+        };
       } finally {
         button.disabled = false;
       }
     }
 
-    async function startAppleAccountLogin() {
+	    async function startAppleAccountLogin() {
       const appleId = $('protocolAppleId').value.trim();
-      const data = await api('/api/apple-account/login/start', {method:'POST', body: JSON.stringify({
-        apple_id: appleId,
-        password: $('protocolPassword').value,
-        two_factor_method: twoFactorMethodPayloadValue('appleAccount2FAMethod')
-      })});
-      $('protocolPassword').value = '';
-      if (data.needs_2fa) {
-        appleAccountPendingID = data.pending_id || '';
-        log(`${data.message || '新接口需要 2FA'}：${data.apple_id || appleId}，有效期 ${data.expires_at || '-'}`);
-        $('icloudSessionInfo').textContent = `${data.message || '新接口需要 2FA'}\n账号：${data.apple_id || appleId}\n有效期：${data.expires_at || '-'}`;
+      const password = $('protocolPassword').value;
+      if (!appleId || !password) {
+        $('icloudSessionInfo').textContent = '请输入 Apple ID 和密码后再开始新接口登录。';
+        log('新接口登录未开始：请输入 Apple ID 和密码');
         return;
       }
-      renderICloudSession(data.session);
-      if (data.sessions) renderICloudSessions(data.sessions);
-      log('新接口登录态已保存：' + (data.session.apple_id || appleId));
-      await refresh();
+      setLoginStartBusy('appleAccountLoginButton', true);
+      $('icloudSessionInfo').textContent = '正在连接 Apple 并验证账号密码，请等待...';
+      log('开始新接口登录：正在连接 Apple');
+      try {
+        const data = await api('/api/apple-account/login/start', {method:'POST', body: JSON.stringify({
+          apple_id: appleId,
+          password,
+          sms_link: $('appleSMSLink').value.trim(),
+          two_factor_method: twoFactorMethodPayloadValue('appleAccount2FAMethod')
+        })});
+	        if (data.needs_2fa) {
+	          const pendingKind = data.fallback_kind === 'icloud_web' ? 'icloud_web' : 'apple_account';
+	          if (pendingKind === 'icloud_web') {
+	            appleAccountPendingID = '';
+	            protocolPendingID = data.pending_id || '';
+	          } else {
+	            appleAccountPendingID = data.pending_id || '';
+	            protocolPendingID = '';
+	          }
+	          log(`${data.message || '新接口需要 2FA'}：${data.apple_id || appleId}，有效期 ${data.expires_at || '-'}`);
+	          $('icloudSessionInfo').textContent = `${data.message || '新接口需要 2FA'}\n账号：${data.apple_id || appleId}\n有效期：${data.expires_at || '-'}`;
+	          void autoFillSMSCode(pendingKind, data.pending_id || '');
+	          return;
+        }
+        renderICloudSession(data.session);
+        if (data.sessions) renderICloudSessions(data.sessions);
+        $('icloudSessionInfo').textContent = data.message || '新接口登录成功，登录态已保存。';
+        log('新接口登录态已保存：' + (data.session.apple_id || appleId));
+        await refresh();
+      } catch (err) {
+        const message = err && err.message ? err.message : '请求失败';
+        $('icloudSessionInfo').textContent = '新接口登录失败：' + message;
+        log('新接口登录失败：' + message);
+      } finally {
+        setLoginStartBusy('appleAccountLoginButton', false);
+      }
     }
 
-    async function submitAppleAccount2FA() {
+    async function submitAppleAccount2FA(fromAuto = false) {
+      if (!fromAuto) stopSMSCodePolling('apple_account');
       if (!appleAccountPendingID) {
         log('没有待验证的新接口登录，请先点击“新接口登录”');
         $('icloudSessionInfo').textContent = '没有待验证的新接口登录，请先点击“新接口登录”。';
-        return;
+        return {success: false, retryable: false};
       }
       const code = $('protocol2FA').value.trim();
-      if (!/^\d{6}$/.test(code)) {
+      if (code && !/^\d{6}$/.test(code)) {
         log('新接口验证码提交失败：请输入 6 位验证码');
         $('icloudSessionInfo').textContent = '新接口验证码提交失败：请输入 6 位验证码。';
-        return;
+        return {success: false, retryable: false};
       }
       const button = $('appleAccount2FAButton');
       const pendingID = appleAccountPendingID;
@@ -2897,19 +3074,33 @@
       $('icloudSessionInfo').textContent = '已提交新接口验证码，正在验证并保存登录态...';
       log('已提交新接口验证码，正在验证并保存登录态');
       try {
-        const data = await api('/api/apple-account/login/2fa', {method:'POST', body: JSON.stringify({
+	        const data = await api('/api/apple-account/login/2fa', {method:'POST', body: JSON.stringify({
           pending_id: pendingID,
           code
         })});
+	        if (data.needs_2fa && data.fallback_kind === 'icloud_web') {
+	          appleAccountPendingID = '';
+	          protocolPendingID = data.pending_id || '';
+	          $('protocol2FA').value = '';
+	          $('icloudSessionInfo').textContent = `${data.message || '已切换旧接口登录'}\n有效期：${data.expires_at || '-'}`;
+	          log(data.message || '新接口管理接口不可用，已切换旧接口登录');
+	          if (protocolPendingID) void autoFillSMSCode('icloud_web', protocolPendingID);
+	          return {success: true, retryable: false};
+	        }
         appleAccountPendingID = '';
         $('protocol2FA').value = '';
         renderICloudSession(data.session);
         if (data.sessions) renderICloudSessions(data.sessions);
         log((data.message || '新接口登录态已保存') + '：' + (data.session.apple_id || '-'));
         await refresh();
+        return {success: true, retryable: false};
       } catch (err) {
         log('新接口验证码提交失败：' + err.message);
         $('icloudSessionInfo').textContent = '新接口验证码提交失败：' + err.message;
+        return {
+          success: false,
+          retryable: err && (err.code === 'apple_2fa_failed' || err.code === 'invalid_2fa_code')
+        };
       } finally {
         button.disabled = false;
       }

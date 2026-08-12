@@ -30,8 +30,15 @@ func TestLiveAppleAccountManageLoginAndSave(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
+	method := normalizeAppleTwoFactorMethod(os.Getenv("IPM_LIVE_TWO_FACTOR_METHOD"))
+	smsRaw := strings.TrimSpace(os.Getenv("IPM_LIVE_SMS_LINK"))
+	credentials, err := newAppleLoginCredentials(appleID, password, smsRaw, method)
+	if err != nil {
+		t.Fatalf("prepare live Apple credentials: %v", err)
+	}
 	pendingStore := newAppleAuthPendingStore()
-	result, err := NewAppleAuthClient().StartAppleAccountManageLogin(ctx, appleID, password, pendingStore, appleTwoFactorMethodTrustedDevice)
+	client := NewAppleAuthClient()
+	result, err := client.StartAppleAccountManageLogin(ctx, appleID, password, pendingStore, method)
 	if err != nil {
 		t.Fatalf("start Apple Account manage login: %v", err)
 	}
@@ -39,19 +46,43 @@ func TestLiveAppleAccountManageLoginAndSave(t *testing.T) {
 	session := result.Session
 	if result.Needs2FA {
 		fmt.Fprintf(os.Stderr, "LIVE_APPLE_ACCOUNT_NEEDS_2FA apple_id=%s message=%s\n", result.AppleID, result.Message)
-		code := strings.TrimSpace(os.Getenv("IPM_LIVE_2FA_CODE"))
-		if code == "" {
-			code = waitForLive2FACode(ctx, t)
-		}
 		pending, ok := pendingStore.get(result.PendingID)
 		if !ok {
 			t.Fatalf("pending Apple Account login expired")
 		}
+		pending.Credentials = credentials
 		phoneNumber := bytes.TrimSpace([]byte(os.Getenv("IPM_LIVE_PHONE_NUMBER_JSON")))
-		session, err = NewAppleAuthClient().SubmitAppleAccountManage2FA(ctx, pending, code, phoneNumber)
-		if err != nil {
-			t.Fatalf("submit Apple Account manage 2FA: %v", err)
+		for attempt := 1; attempt <= 3; attempt++ {
+			code := strings.TrimSpace(os.Getenv("IPM_LIVE_2FA_CODE"))
+			if smsRaw != "" {
+				link, linkErr := ParseAppleSMSLink(smsRaw)
+				if linkErr != nil {
+					t.Fatalf("parse live SMS link: %v", linkErr)
+				}
+				code, err = waitAppleSMSCode(ctx, client.httpClient, link, appleSMSWaitTimeout)
+			} else if code == "" {
+				code = waitForLive2FACode(ctx, t)
+			}
+			if err == nil {
+				session, err = client.SubmitAppleAccountManage2FA(ctx, pending, code, phoneNumber)
+			}
+			if err == nil {
+				break
+			}
+			if !isCodedError(err, "apple_2fa_failed") && !isCodedError(err, "invalid_2fa_code") {
+				t.Fatalf("submit Apple Account manage 2FA: %v", err)
+			}
+			if attempt == 3 {
+				t.Fatalf("submit Apple Account manage 2FA failed after 3 codes: %v", err)
+			}
+			err = nil
+			time.Sleep(5 * time.Second)
 		}
+	}
+	session = withAppleLoginCredentials(session, credentials)
+	session, err = verifyAppleLoginSession(ctx, session, LoginStateAppleAccount)
+	if err != nil {
+		t.Fatalf("verify Apple Account manage session: %v", err)
 	}
 
 	if err := store.SaveICloudSessionForOwner(ownerID, session); err != nil {
@@ -71,6 +102,90 @@ func TestLiveAppleAccountManageLoginAndSave(t *testing.T) {
 		strings.TrimSpace(state.APIKey) != "",
 		strings.TrimSpace(state.Scnt) != "",
 		len(saved.LoginStates),
+	)
+}
+
+func TestLiveICloudWebLoginAndSave(t *testing.T) {
+	appleID := strings.TrimSpace(os.Getenv("IPM_LIVE_APPLE_ID"))
+	password := os.Getenv("IPM_LIVE_PASSWORD")
+	if appleID == "" || strings.TrimSpace(password) == "" {
+		t.Skip("set IPM_LIVE_APPLE_ID and IPM_LIVE_PASSWORD to run live iCloud web protocol login")
+	}
+
+	cfg := loadLiveConfig(t)
+	store, err := NewFileStore(cfg.DataPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	ownerID := liveOwnerID(store)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	method := normalizeAppleTwoFactorMethod(os.Getenv("IPM_LIVE_TWO_FACTOR_METHOD"))
+	smsRaw := strings.TrimSpace(os.Getenv("IPM_LIVE_SMS_LINK"))
+	credentials, err := newAppleLoginCredentials(appleID, password, smsRaw, method)
+	if err != nil {
+		t.Fatalf("prepare live Apple credentials: %v", err)
+	}
+	pendingStore := newAppleAuthPendingStore()
+	client := NewAppleAuthClient()
+	result, err := client.StartLogin(ctx, appleID, password, cfg.ICloudDefaultHost, cfg.ICloudClientID, pendingStore, method)
+	if err != nil {
+		t.Fatalf("start iCloud web login: %v", err)
+	}
+
+	session := result.Session
+	if result.Needs2FA {
+		pending, ok := pendingStore.get(result.PendingID)
+		if !ok {
+			t.Fatalf("pending iCloud web login expired")
+		}
+		pending.Credentials = credentials
+		for attempt := 1; attempt <= 3; attempt++ {
+			code := strings.TrimSpace(os.Getenv("IPM_LIVE_2FA_CODE"))
+			if smsRaw != "" {
+				link, linkErr := ParseAppleSMSLink(smsRaw)
+				if linkErr != nil {
+					t.Fatalf("parse live SMS link: %v", linkErr)
+				}
+				code, err = waitAppleSMSCode(ctx, client.httpClient, link, appleSMSWaitTimeout)
+			} else if code == "" {
+				code = waitForLive2FACode(ctx, t)
+			}
+			if err == nil {
+				session, err = client.Submit2FA(ctx, pending, code)
+			}
+			if err == nil {
+				break
+			}
+			if !isCodedError(err, "apple_2fa_failed") && !isCodedError(err, "invalid_2fa_code") {
+				t.Fatalf("submit iCloud web 2FA: %v", err)
+			}
+			if attempt == 3 {
+				t.Fatalf("submit iCloud web 2FA failed after 3 codes: %v", err)
+			}
+			err = nil
+			time.Sleep(5 * time.Second)
+		}
+	}
+	session = withAppleLoginCredentials(session, credentials)
+	session, err = verifyAppleLoginSession(ctx, session, LoginStateICloudWeb)
+	if err != nil {
+		t.Fatalf("verify iCloud web session: %v", err)
+	}
+	if err := store.SaveICloudSessionForOwner(ownerID, session); err != nil {
+		t.Fatalf("save iCloud web session: %v", err)
+	}
+	state, ok := iCloudWebLoginState(session)
+	if !ok || !state.LastCheckOK {
+		t.Fatalf("saved iCloud web session is not healthy: ok=%t state=%+v", ok, state)
+	}
+	fmt.Fprintf(os.Stderr, "LIVE_ICLOUD_WEB_SAVED owner_id=%s apple_id=%s has_dsid=%t has_premium_url=%t login_states=%d\n",
+		ownerID,
+		maskAppleID(session.AppleID),
+		strings.TrimSpace(session.DSID) != "",
+		strings.TrimSpace(session.PremiumMailBaseURL) != "",
+		len(session.LoginStates),
 	)
 }
 
