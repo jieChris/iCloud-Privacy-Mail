@@ -775,6 +775,8 @@
     }
     .field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 16px 18px; }
     .field-grid .full, .form .full { grid-column: 1 / -1; }
+    .account-paste-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+    .account-paste-row .muted { font-size: 12px; line-height: 1.5; }
     .panel-body { padding-bottom: 2px; }
     label, .field-label { display: flex; flex-direction: column; gap: 7px; color: var(--muted); font-size: 12px; font-weight: 700; }
     input, textarea, select {
@@ -1194,20 +1196,24 @@
           </div>
           <div class="notice" id="icloudSessionInfo">未完成创建登录。建议先点“新接口登录”或“旧接口登录”；收到 2FA 后提交对应验证码。取码登录会单独保存。</div>
           <div class="field-grid">
+            <div class="full account-paste-row">
+              <button id="appleAccountPasteButton" type="button" onclick="pasteAppleAccountCredentials()">一键粘贴账号</button>
+              <span id="appleAccountPasteStatus" class="muted">剪贴板格式：账号-密码-手机号-链接</span>
+            </div>
             <label>Apple ID<input id="protocolAppleId" autocomplete="username" placeholder="name@icloud.com"></label>
             <label>密码<input id="protocolPassword" type="password" autocomplete="current-password" placeholder="Apple ID 密码"></label>
             <label class="full">手机号 | 短信链接<input id="appleSMSLink" autocomplete="off" placeholder="+19858008317|http://a.62-us.com/api/get_sms?key=..."></label>
             <label class="full">2FA 验证码<input id="protocol2FA" inputmode="numeric" maxlength="6" placeholder="收到后输入 6 位验证码"></label>
             <label>新接口验证码方式
               <select id="appleAccount2FAMethod">
+                <option value="phone" selected>短信/手机号验证码</option>
                 <option value="trusted_device">受信任设备</option>
-                <option value="phone">短信/手机号验证码</option>
               </select>
             </label>
             <label>旧接口验证码方式
               <select id="iCloudWeb2FAMethod">
+                <option value="phone" selected>短信/手机号验证码</option>
                 <option value="trusted_device">受信任设备</option>
-                <option value="phone">短信/手机号验证码</option>
               </select>
             </label>
           </div>
@@ -1720,7 +1726,8 @@
     function normalizeTwoFactorMethodValue(value) {
       const normalized = String(value || '').trim().toLowerCase();
       if (['phone', 'sms', 'phone_sms', 'trusted_phone', 'trusted_phone_number'].includes(normalized)) return 'phone';
-      return 'trusted_device';
+      if (normalized === 'trusted_device') return 'trusted_device';
+      return 'phone';
     }
 
     function twoFactorMethodPayloadValue(id) {
@@ -1732,6 +1739,69 @@
       const el = $(id);
       if (!el) return;
       el.value = normalizeTwoFactorMethodValue(value);
+    }
+
+    function parseAppleAccountPaste(raw) {
+      const value = String(raw || '').trim();
+      const linkMatch = value.match(/-(https?:\/\/\S+)$/i);
+      if (!linkMatch || linkMatch.index === undefined) {
+        throw new Error('格式错误，应为：账号-密码-手机号-链接');
+      }
+      const prefix = value.slice(0, linkMatch.index);
+      const phoneMatch = prefix.match(/-(\+[1-9][0-9 ()-]{6,})$/);
+      if (!phoneMatch || phoneMatch.index === undefined) {
+        throw new Error('未识别到国际格式手机号');
+      }
+      const accountPassword = prefix.slice(0, phoneMatch.index);
+      const atIndex = accountPassword.indexOf('@');
+      let separator = atIndex >= 0 ? accountPassword.indexOf('-', atIndex + 1) : -1;
+      if (separator < 1) separator = accountPassword.indexOf('-');
+      if (separator < 1 || separator >= accountPassword.length - 1) {
+        throw new Error('未识别到账号或密码');
+      }
+      const appleId = accountPassword.slice(0, separator).trim();
+      const password = accountPassword.slice(separator + 1).trim();
+      const phone = phoneMatch[1].replace(/[ ()-]/g, '').trim();
+      const link = linkMatch[1].trim();
+      if (!appleId || !password || !/^\S+@\S+$/.test(appleId) || !/^\+[1-9][0-9]{6,14}$/.test(phone)) {
+        throw new Error('账号、密码或手机号格式错误');
+      }
+      return {appleId, password, smsLink: `${phone}|${link}`};
+    }
+
+    async function readClipboardText() {
+      if (navigator.clipboard && typeof navigator.clipboard.readText === 'function') {
+        try {
+          return await navigator.clipboard.readText();
+        } catch (_) {
+          // Clipboard-read permission is unavailable on some HTTP pages.
+        }
+      }
+      const pasted = window.prompt('请粘贴账号-密码-手机号-链接内容');
+      if (pasted === null) throw new Error('已取消粘贴');
+      return pasted;
+    }
+
+    async function pasteAppleAccountCredentials() {
+      const button = $('appleAccountPasteButton');
+      const status = $('appleAccountPasteStatus');
+      if (button) button.disabled = true;
+      try {
+        const parsed = parseAppleAccountPaste(await readClipboardText());
+        $('protocolAppleId').value = parsed.appleId;
+        $('protocolPassword').value = parsed.password;
+        $('appleSMSLink').value = parsed.smsLink;
+        $('protocol2FA').value = '';
+        setTwoFactorMethodSelect('appleAccount2FAMethod', 'phone');
+        setTwoFactorMethodSelect('iCloudWeb2FAMethod', 'phone');
+        if (status) status.textContent = '已填充，登录时优先使用短信验证码';
+        log('已一键填充 Apple 账号信息，默认使用短信验证码');
+      } catch (err) {
+        if (status) status.textContent = err.message || '粘贴失败';
+        log('一键粘贴账号失败：' + (err.message || '格式错误'));
+      } finally {
+        if (button) button.disabled = false;
+      }
     }
 
     function collectCreateSettingsPayload() {

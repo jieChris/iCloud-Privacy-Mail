@@ -36,8 +36,10 @@ func normalizeAppleTwoFactorMethod(method string) string {
 	switch strings.ToLower(strings.TrimSpace(method)) {
 	case appleTwoFactorMethodPhone, "sms", "phone_sms", "trusted_phone", "trusted_phone_number":
 		return appleTwoFactorMethodPhone
-	default:
+	case appleTwoFactorMethodTrustedDevice:
 		return appleTwoFactorMethodTrustedDevice
+	default:
+		return appleTwoFactorMethodPhone
 	}
 }
 

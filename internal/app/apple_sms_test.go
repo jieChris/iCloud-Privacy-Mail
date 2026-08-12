@@ -30,6 +30,28 @@ func TestParseAppleSMSLink(t *testing.T) {
 	}
 }
 
+func TestNormalizeAppleTwoFactorMethodDefaultsToPhone(t *testing.T) {
+	if got := normalizeAppleTwoFactorMethod(""); got != appleTwoFactorMethodPhone {
+		t.Fatalf("empty method = %q, want %q", got, appleTwoFactorMethodPhone)
+	}
+	if got := normalizeAppleTwoFactorMethod("unknown"); got != appleTwoFactorMethodPhone {
+		t.Fatalf("unknown method = %q, want %q", got, appleTwoFactorMethodPhone)
+	}
+	if got := normalizeAppleTwoFactorMethod("trusted_device"); got != appleTwoFactorMethodTrustedDevice {
+		t.Fatalf("explicit trusted device = %q, want %q", got, appleTwoFactorMethodTrustedDevice)
+	}
+}
+
+func TestDefaultCreateSettingsUsePhoneTwoFactor(t *testing.T) {
+	settings := defaultCreateSettings("owner-1")
+	if settings.AppleAccountTwoFactorMethod != appleTwoFactorMethodPhone {
+		t.Fatalf("Apple Account default method = %q, want %q", settings.AppleAccountTwoFactorMethod, appleTwoFactorMethodPhone)
+	}
+	if settings.ICloudWebTwoFactorMethod != appleTwoFactorMethodPhone {
+		t.Fatalf("iCloud Web default method = %q, want %q", settings.ICloudWebTwoFactorMethod, appleTwoFactorMethodPhone)
+	}
+}
+
 func TestFetchAppleSMSCodeParsesJSONAndPendingResponse(t *testing.T) {
 	attempts := 0
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
